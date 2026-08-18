@@ -70,6 +70,21 @@ def generateSignature(wss, script_file='sign.js'):
     # return ret.get('X-Bogus')
 
 
+def generate_a_bogus(params_str, user_agent, script_file='lib/reverse/douyin_old_algo_ref.js'):
+    """
+    通过 py_mini_racer 调用 douyin_old_algo_ref.js 中的 sign_datail 生成 a_bogus
+    :param params_str: URL 查询参数字符串
+    :param user_agent: User-Agent 字符串
+    :param script_file: JS 签名脚本路径
+    :return: a_bogus 签名字符串
+    """
+    with codecs.open(script_file, 'r', encoding='utf8') as f:
+        script = f.read()
+    ctx = MiniRacer()
+    ctx.eval(script)
+    return ctx.call("sign_datail", params_str, user_agent)
+
+
 def generateMsToken(length=107):
     """
     产生请求头部cookie中的msToken字段，其实为随机的107位字符
@@ -174,18 +189,39 @@ class DouyinLiveWebFetcher:
         room_status: 2 直播已结束
         room_status: 0 直播进行中
         """
-        url = ('https://live.douyin.com/webcast/room/web/enter/?aid=6383'
-               '&app_name=douyin_web&live_id=1&device_platform=web&language=zh-CN&enter_from=web_live'
-               '&cookie_enabled=true&screen_width=1536&screen_height=864&browser_language=zh-CN&browser_platform=Win32'
-               '&browser_name=Edge&browser_version=133.0.0.0'
-               f'&web_rid={self.live_id}'
-               f'&room_id_str={self.room_id}'
-               '&enter_source=&is_need_double_stream=false&insert_task_id=&live_reason='
-               '&msToken=&a_bogus=')
+        ms_token = generateMsToken()
+        params = {
+            'aid': '6383',
+            'app_name': 'douyin_web',
+            'live_id': '1',
+            'device_platform': 'web',
+            'language': 'zh-CN',
+            'enter_from': 'web_live',
+            'cookie_enabled': 'true',
+            'screen_width': '1536',
+            'screen_height': '864',
+            'browser_language': 'zh-CN',
+            'browser_platform': 'Win32',
+            'browser_name': 'Edge',
+            'browser_version': '133.0.0.0',
+            'web_rid': self.live_id,
+            'room_id_str': self.room_id,
+            'enter_source': '',
+            'is_need_double_stream': 'false',
+            'insert_task_id': '',
+            'live_reason': '',
+            'msToken': ms_token,
+        }
+        query_str = '&'.join(f"{k}={urllib.parse.quote(str(v))}" for k, v in params.items())
+        a_bogus = generate_a_bogus(query_str, self.user_agent)
+        params['a_bogus'] = a_bogus
+
+        url = 'https://live.douyin.com/webcast/room/web/enter/'
         try:
-            resp = requests.get(url, headers={
+            resp = requests.get(url, params=params, headers={
                 'User-Agent': self.user_agent,
-                'Cookie': f'ttwid={self.ttwid};'
+                'Cookie': f'ttwid={self.ttwid}; msToken={ms_token}; __ac_nonce=0123407cc00a9e438deb4',
+                'Referer': f'https://live.douyin.com/{self.live_id}',
             })
             resp.raise_for_status()
             data = resp.json().get('data')
@@ -208,38 +244,44 @@ class DouyinLiveWebFetcher:
         """
         获取直播间观众用户数据
         """
-        # 构建URL
-        url = f"https://live.douyin.com/webcast/ranklist/audience/?aid=6383&app_name=douyin_web&webcast_sdk_version=2450&room_id={self.room_id}&anchor_id={anchor_id}&rank_type=30&a_bogus="
-        url2 = f"https://live.douyin.com/webcast/ranklist/audience/?aid=6383&app_name=douyin_web&webcast_sdk_version=2450&room_id={self.room_id}&anchor_id={anchor_id}&rank_type=30&a_bogus="
+        ms_token = generateMsToken()
+        params = {
+            'aid': '6383',
+            'app_name': 'douyin_web',
+            'webcast_sdk_version': '2450',
+            'room_id': self.room_id,
+            'anchor_id': anchor_id,
+            'rank_type': '30',
+            'msToken': ms_token,
+        }
+        query_str = '&'.join(f"{k}={urllib.parse.quote(str(v))}" for k, v in params.items())
+        a_bogus = generate_a_bogus(query_str, self.user_agent)
+        params['a_bogus'] = a_bogus
 
         headers = {
-            'User-Agent': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36 Edg/138.0.0.0",
+            'User-Agent': self.user_agent,
+            'Cookie': f'ttwid={self.ttwid}; msToken={ms_token}; __ac_nonce=0123407cc00a9e438deb4',
+            'Referer': f'https://live.douyin.com/{self.live_id}',
         }
 
         self.log("RANK", f"获取观众用户数据数据中.....")
 
         try:
-            # 先尝试普通用户路线
-            response = requests.get(url, headers=headers)
+            response = requests.get(
+                'https://live.douyin.com/webcast/ranklist/audience/',
+                params=params,
+                headers=headers,
+            )
             response.raise_for_status()
             data = json.loads(response.text)
 
-            # 检查响应中是否包含数据
             if 'data' not in data or 'ranks' not in data['data']:
-                # 如果普通用户路线失败，尝试VIP路线
-                self.log("RANK", "普通用户路线未获取到数据，尝试VIP路线...")
-                response = requests.get(url2, headers=headers)
-                response.raise_for_status()
-                data = json.loads(response.text)
-
-                if 'data' not in data or 'ranks' not in data['data']:
-                    self.log("ERROR", "VIP路线也未获取到排名数据，请检查输入的房间ID和主播ID是否正确")
-                    return []
+                self.log("ERROR", "未获取到排名数据，请检查输入的房间ID和主播ID是否正确")
+                return []
 
             ranks = data['data']['ranks']
             account_list = []
             for rank in ranks:
-                # 确保用户信息存在
                 if 'user' in rank and 'id' in rank['user']:
                     user = rank['user']
                     account_info = {
@@ -357,21 +399,23 @@ class DouyinLiveWebFetcher:
         for msg in response.messages_list:
             method = msg.method
             try:
-                {
-                    'WebcastChatMessage': self._parseChatMsg,  # 聊天消息
-                    'WebcastGiftMessage': self._parseGiftMsg,  # 礼物消息
-                    'WebcastLikeMessage': self._parseLikeMsg,  # 点赞消息
-                    'WebcastMemberMessage': self._parseMemberMsg,  # 进入直播间消息
-                    'WebcastSocialMessage': self._parseSocialMsg,  # 关注消息
-                    'WebcastRoomUserSeqMessage': self._parseRoomUserSeqMsg,  # 直播间统计
-                    'WebcastFansclubMessage': self._parseFansclubMsg,  # 粉丝团消息
-                    'WebcastControlMessage': self._parseControlMsg,  # 直播间状态消息
-                    'WebcastEmojiChatMessage': self._parseEmojiChatMsg,  # 聊天表情包消息
-                    'WebcastRoomStatsMessage': self._parseRoomStatsMsg,  # 直播间统计信息
-                    'WebcastRoomMessage': self._parseRoomMsg,  # 直播间信息
-                    'WebcastRoomRankMessage': self._parseRankMsg,  # 直播间用户数据信息
-                    'WebcastRoomStreamAdaptationMessage': self._parseRoomStreamAdaptationMsg,  # 直播间流配置
-                }.get(method)(msg.payload)
+                handler = {
+                    'WebcastChatMessage': self._parseChatMsg,
+                    'WebcastGiftMessage': self._parseGiftMsg,
+                    'WebcastLikeMessage': self._parseLikeMsg,
+                    'WebcastMemberMessage': self._parseMemberMsg,
+                    'WebcastSocialMessage': self._parseSocialMsg,
+                    'WebcastRoomUserSeqMessage': self._parseRoomUserSeqMsg,
+                    'WebcastFansclubMessage': self._parseFansclubMsg,
+                    'WebcastControlMessage': self._parseControlMsg,
+                    'WebcastEmojiChatMessage': self._parseEmojiChatMsg,
+                    'WebcastRoomStatsMessage': self._parseRoomStatsMsg,
+                    'WebcastRoomMessage': self._parseRoomMsg,
+                    'WebcastRoomRankMessage': self._parseRankMsg,
+                    'WebcastRoomStreamAdaptationMessage': self._parseRoomStreamAdaptationMsg,
+                }.get(method)
+                if handler:
+                    handler(msg.payload)
             except Exception as e:
                 self.log("ERROR", f"尝试解析消息可能出错: {str(e)}")
 
@@ -410,7 +454,7 @@ class DouyinLiveWebFetcher:
         message = MemberMessage().parse(payload)
         user_name = message.user.nick_name
         user_id = message.user.id
-        gender = ["女", "男"][message.user.gender]
+        gender = ["女", "男"][message.user.gender] if message.user.gender in (0, 1) else "未知"
         self.log("ENTER", f"[{user_id}][{gender}]{user_name} 进入了直播间")
 
     def _parseSocialMsg(self, payload):
