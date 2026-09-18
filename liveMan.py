@@ -18,9 +18,28 @@ import requests
 import websocket
 import json
 from py_mini_racer import MiniRacer
-import tkinter as tk
-from tkinter import ttk, scrolledtext, messagebox, simpledialog
 from protobuf.douyin import *
+
+# GUI 依赖惰性导入：无 tkinter 的 Linux 服务器也能 import 本模块（仅 GUI 功能不可用）
+try:
+    import tkinter as tk
+    from tkinter import ttk, scrolledtext, messagebox, simpledialog
+except ImportError:
+    tk = ttk = scrolledtext = messagebox = simpledialog = None
+
+# 完整浏览器请求头：抖音风控对缺失浏览器特征头的请求返回 HTTP 444（数据中心 IP 尤其严格）
+COMMON_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Cache-Control": "max-age=0",
+}
 
 
 @contextmanager
@@ -101,12 +120,13 @@ def generateMsToken(length=107):
 
 class DouyinLiveWebFetcher:
 
-    def __init__(self, live_id, log_callback=None):
+    def __init__(self, live_id, log_callback=None, data_callback=None):
         """
         直播间弹幕抓取对象
         :param live_id: 直播间的直播id，打开直播间web首页的链接如：https://live.douyin.com/261378947940  ，
                         其中的261378947940即是live_id
         :param log_callback: 日志回调函数
+        :param data_callback: 结构化数据回调函数 data_callback(event_type, data_dict)
         """
         self.__ttwid = None
         self.__room_id = None
@@ -115,9 +135,13 @@ class DouyinLiveWebFetcher:
         self.user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) " \
                           "Chrome/120.0.0.0 Safari/537.36"
         self.log_callback = log_callback
+        self.data_callback = data_callback
         self.ws = None
         self.heartbeat_thread = None
         self.running = False
+        self.product_ids = set()  # 缓存直播间出现的商品 promotion_id
+        self.product_refresh_order = []  # 商品列表刷新顺序（best-effort 对齐面板商品 num）
+        self.on_offline = None  # 下播回调（ControlMessage status==3 时触发）
 
     def log(self, log_type, message):
         """记录日志"""
@@ -125,6 +149,14 @@ class DouyinLiveWebFetcher:
             self.log_callback(log_type, message)
         else:
             print(f"[{log_type}] {message}")
+
+    def _emit_data(self, event_type, data):
+        """输出结构化数据（若提供 data_callback）"""
+        if self.data_callback:
+            try:
+                self.data_callback(event_type, data)
+            except Exception:
+                pass
 
     def start(self):
         self.running = True
@@ -145,9 +177,7 @@ class DouyinLiveWebFetcher:
         """
         if self.__ttwid:
             return self.__ttwid
-        headers = {
-            "User-Agent": self.user_agent,
-        }
+        headers = dict(COMMON_HEADERS)
         try:
             response = requests.get(self.live_url, headers=headers)
             response.raise_for_status()
@@ -166,10 +196,8 @@ class DouyinLiveWebFetcher:
         if self.__room_id:
             return self.__room_id
         url = self.live_url + self.live_id
-        headers = {
-            "User-Agent": self.user_agent,
-            "cookie": f"ttwid={self.ttwid}&msToken={generateMsToken()}; __ac_nonce=0123407cc00a9e438deb4",
-        }
+        headers = {**COMMON_HEADERS,
+                   "cookie": f"ttwid={self.ttwid}&msToken={generateMsToken()}; __ac_nonce=0123407cc00a9e438deb4"}
         try:
             response = requests.get(url, headers=headers)
             response.raise_for_status()
@@ -178,7 +206,8 @@ class DouyinLiveWebFetcher:
         else:
             match = re.search(r'roomId\\":\\"(\d+)\\"', response.text)
             if match is None or len(match.groups()) < 1:
-                self.log("ERROR", "未找到匹配的roomId")
+                self.log("ERROR", "未找到匹配的roomId（可能未开播）")
+                return None
 
             self.__room_id = match.group(1)
             return self.__room_id
@@ -219,7 +248,7 @@ class DouyinLiveWebFetcher:
         url = 'https://live.douyin.com/webcast/room/web/enter/'
         try:
             resp = requests.get(url, params=params, headers={
-                'User-Agent': self.user_agent,
+                **COMMON_HEADERS,
                 'Cookie': f'ttwid={self.ttwid}; msToken={ms_token}; __ac_nonce=0123407cc00a9e438deb4',
                 'Referer': f'https://live.douyin.com/{self.live_id}',
             })
@@ -298,6 +327,24 @@ class DouyinLiveWebFetcher:
         except Exception as e:
             self.log("ERROR", f"获取观众用户数据时出错: {str(e)}")
             return []
+
+    def get_product_detail(self, promotion_id):
+        """
+        获取商品详情（标题/价格/图片）。
+        注意：抖音商城商品详情 JSON API 需进一步逆向（含签名），
+        当前返回商品详情页 URL，供后续增强。
+        """
+        return {
+            'promotion_id': str(promotion_id),
+            'detail_url': f'https://haohuo.jinritemai.com/views/product/detail?id={promotion_id}',
+            'title': None,
+            'price': None,
+            'image_url': None,
+        }
+
+    def get_product_ids(self):
+        """返回直播间采集到的商品 promotion_id 列表"""
+        return sorted(self.product_ids)
 
     def _connectWebSocket(self):
         """
@@ -413,6 +460,9 @@ class DouyinLiveWebFetcher:
                     'WebcastRoomMessage': self._parseRoomMsg,
                     'WebcastRoomRankMessage': self._parseRankMsg,
                     'WebcastRoomStreamAdaptationMessage': self._parseRoomStreamAdaptationMsg,
+                    'WebcastLiveShoppingMessage': self._parseLiveShoppingMsg,
+                    'WebcastLiveEcomGeneralMessage': self._parseLiveEcomGeneralMsg,
+                    'WebcastProductChangeMessage': self._parseProductChangeMsg,
                 }.get(method)
                 if handler:
                     handler(msg.payload)
@@ -433,21 +483,29 @@ class DouyinLiveWebFetcher:
         user_id = message.user.id
         content = message.content
         self.log("CHAT", f"[{user_id}]{user_name}: {content}")
+        self._emit_data("chat", {"user_id": str(user_id), "nickname": user_name, "content": content})
 
     def _parseGiftMsg(self, payload):
         """礼物消息"""
         message = GiftMessage().parse(payload)
         user_name = message.user.nick_name
+        user_id = message.user.id
         gift_name = message.gift.name
         gift_cnt = message.combo_count
+        diamond_count = message.gift.diamond_count
         self.log("GIFT", f"{user_name} 送出了 {gift_name}x{gift_cnt}")
+        self._emit_data("gift", {"user_id": str(user_id), "nickname": user_name,
+                                 "gift_name": gift_name, "gift_count": gift_cnt,
+                                 "diamond_value": diamond_count})
 
     def _parseLikeMsg(self, payload):
-        '''点赞消息'''
+        '''点赞消息（total 为直播间累计点赞，count 为本次增量）'''
         message = LikeMessage().parse(payload)
         user_name = message.user.nick_name
         count = message.count
-        self.log("LIKE", f"{user_name} 点了{count}个赞")
+        total = message.total
+        self.log("LIKE", f"{user_name} 点了{count}个赞，累计 {total}")
+        self._emit_data("like", {"nickname": user_name, "count": count, "total": total})
 
     def _parseMemberMsg(self, payload):
         '''进入直播间消息'''
@@ -456,13 +514,33 @@ class DouyinLiveWebFetcher:
         user_id = message.user.id
         gender = ["女", "男"][message.user.gender] if message.user.gender in (0, 1) else "未知"
         self.log("ENTER", f"[{user_id}][{gender}]{user_name} 进入了直播间")
+        self._emit_data("enter", {"user_id": str(user_id), "nickname": user_name, "gender": gender})
 
     def _parseSocialMsg(self, payload):
-        '''关注消息'''
+        '''社交消息（关注/分享，按 action 区分）
+
+        action 语义（与辉同行 1h 实测 2026-09-17 定案）：
+          1 = 关注（follow_count 为实时粉丝总数，单调递增）
+          3 = 分享（follow_count 恒为 0，因为分享不改变粉丝数；share_type/share_target 区分分享渠道）
+          2（取消关注）在整段观测中未出现，属罕见事件。
+        '''
         message = SocialMessage().parse(payload)
         user_name = message.user.nick_name
         user_id = message.user.id
-        self.log("FOLLOW", f"[{user_id}]{user_name} 关注了主播")
+        action = message.action
+        follow_count = message.follow_count
+        share_type = message.share_type
+        share_target = message.share_target
+        if action == 1:
+            self.log("FOLLOW", f"[{user_id}]{user_name} 关注了主播 (粉丝数 {follow_count})")
+            self._emit_data("follow", {"user_id": str(user_id), "nickname": user_name,
+                                       "action": action, "follow_count": follow_count})
+        else:
+            self.log("SOCIAL", f"[{user_id}]{user_name} action={action}(分享), share_type={share_type}, "
+                               f"share_target={share_target!r}, 粉丝数={follow_count}")
+            self._emit_data("social", {"user_id": str(user_id), "nickname": user_name,
+                                       "action": action, "follow_count": follow_count,
+                                       "share_type": share_type, "share_target": share_target})
 
     def _parseRoomUserSeqMsg(self, payload):
         '''直播间统计'''
@@ -470,12 +548,159 @@ class DouyinLiveWebFetcher:
         current = message.total
         total = message.total_pv_for_anchor
         self.log("STATS", f"当前观看人数: {current}, 累计观看人数: {total}")
+        self._emit_data("stats", {"viewer_count": current, "total_pv": total})
 
     def _parseFansclubMsg(self, payload):
         '''粉丝团消息'''
         message = FansclubMessage().parse(payload)
         content = message.content
         self.log("FANSCLUB", content)
+
+    def _parseLiveShoppingMsg(self, payload):
+        '''商品成交/状态消息（含 promotion_id）
+
+        msg_type 语义（经数据实证）：
+          2 = 成交/下单（与 LiveEcomGeneralMessage 的 LivePopMessage 购买通知一一对应）
+          3 = 下架/讲解结束（语义待完全确认）
+          10 = 其他
+        真正的讲解开始/结束在 ProductChangeMessage（explainType）。
+        注意：LiveShoppingMessage.promotionId（字段3）经灰豚验证并非真正的 promotion_id，
+        成交商品的 promotion_id 以 LiveEcomGeneralMessage 的 LivePopMessage（f6.f2）为准。
+        '''
+        message = LiveShoppingMessage().parse(payload)
+        msg_type = message.msg_type
+        promotion_id = message.promotion_id
+        if promotion_id:
+            self.product_ids.add(promotion_id)
+        type_desc = {2: "成交/下单", 3: "下架/讲解结束", 10: "其他"}.get(msg_type, str(msg_type))
+        self.log("SHOPPING", f"商品状态: type={msg_type}({type_desc}), promotion_id={promotion_id}")
+        self._emit_data("shopping", {"msg_type": msg_type, "promotion_id": str(promotion_id)})
+        if promotion_id:
+            self._emit_data("product", {"promotion_id": str(promotion_id)})
+
+    def _parseLiveEcomGeneralMsg(self, payload):
+        '''电商通用消息（购买通知 / 商品列表刷新）'''
+        message = LiveEcomGeneralMessage().parse(payload)
+        msg_type = message.type
+        timestamp = message.timestamp
+        # 递归解析 biz_content，得到结构化字段列表
+        fields = self._parse_protobuf_fields(message.biz_content)
+
+        if msg_type == 'ProductRefreshMessage':
+            # 商品列表刷新：提取所有 19 位 varint 作为商品 ID（按出现顺序记录，用于对齐面板商品）
+            for fn, wt, val, sub in fields:
+                if wt == 0 and len(str(val)) >= 19:
+                    if val not in self.product_ids:
+                        self.product_refresh_order.append(val)
+                    self.product_ids.add(val)
+                    self._emit_data("product", {"promotion_id": str(val)})
+        elif msg_type == 'LivePopMessage':
+            # 购买通知：购买 ID 在嵌套消息 f6.f2 中。
+            # Bug 2 已定案（2026-09-17 1h 实测）：f6 三元组结构为
+            #   f6.f1 = LiveShoppingMessage.promotionId（字段3，与 shopping 消息同一 ID 体系）
+            #   f6.f2 = 真正的 promotion_id（灰豚 pId/id 命中，讲解成交 80%）
+            #   f6.f3 = unix 时间戳
+            # 同一笔成交，shopping type=2 与 LivePopMessage 各报一次，329 次一一对应但两个 ID 不同。
+            # 仅「成交」类 LivePopMessage 带 f6；其余（点赞榜/进场等）f6 为空。
+            purchase_ids = []
+            f6_dump = []
+            for fn, wt, val, sub in fields:
+                if fn == 6 and sub:
+                    for sfn, swt, sval, _ in sub:
+                        f6_dump.append((sfn, swt, sval))
+                        if sfn == 2 and swt == 0 and len(str(sval)) >= 19:
+                            purchase_ids.append(sval)
+            self.log("PURCHASE", f"type={msg_type}, ts={timestamp}, purchase_ids={purchase_ids}, f6={f6_dump}")
+            if purchase_ids:
+                self._emit_data("purchase", {"msg_type": msg_type, "ids": [str(i) for i in purchase_ids]})
+
+    def _parseProductChangeMsg(self, payload):
+        '''商品变化消息（含讲解状态 explainType）
+
+        ProductChangeMessage 是商品讲解状态变化的真正来源：
+          updateProductInfoList: 商品列表（promotionId + explainType + index）
+          updateToast: 提示文案（如"讲解中"/"已讲解"），可直接辅助确认语义
+        explainType 语义待实测确认（初步假设：0=未讲解, 1=讲解中, 2=已讲解），
+        本方法只记录原始值，不做解释。
+        '''
+        message = ProductChangeMessage().parse(payload)
+        toast = message.update_toast
+        prods = []
+        for pinfo in message.update_product_info_list:
+            pid = pinfo.promotion_id
+            et = pinfo.explain_type
+            idx = pinfo.index
+            if pid:
+                self.product_ids.add(pid)
+                prods.append((pid, et, idx))
+        self.log("PRODUCT", f"商品讲解变化: toast={toast!r}, 商品数={len(prods)}, 明细={[(p, e) for p, e, _ in prods]}")
+        for pid, et, idx in prods:
+            self._emit_data("explain", {"promotion_id": str(pid), "explain_type": et, "index": idx})
+
+    @staticmethod
+    def _parse_protobuf_fields(data, depth=0):
+        """递归解析 protobuf bytes，返回 [(field_num, wire_type, value, sub_fields), ...]
+
+        wire_type: 0=varint, 2=length-delimited(bytes/嵌套消息), 1=64bit, 5=32bit
+        嵌套消息会递归解析并填入 sub_fields。
+        """
+        fields = []
+        i = 0
+        while i < len(data):
+            tag = 0
+            shift = 0
+            while i < len(data):
+                b = data[i]
+                i += 1
+                tag |= (b & 0x7f) << shift
+                shift += 7
+                if not (b & 0x80):
+                    break
+            fn = tag >> 3
+            wt = tag & 0x07
+
+            if wt == 0:  # varint
+                val = 0
+                sh = 0
+                while i < len(data):
+                    b = data[i]
+                    i += 1
+                    val |= (b & 0x7f) << sh
+                    sh += 7
+                    if not (b & 0x80):
+                        break
+                fields.append((fn, wt, val, None))
+
+            elif wt == 2:  # length-delimited
+                length = 0
+                sh = 0
+                while i < len(data):
+                    b = data[i]
+                    i += 1
+                    length |= (b & 0x7f) << sh
+                    sh += 7
+                    if not (b & 0x80):
+                        break
+                chunk = data[i:i + length]
+                i += length
+                # 尝试作为嵌套消息递归解析
+                sub = None
+                if depth < 4 and len(chunk) >= 2:
+                    try:
+                        sub = DouyinLiveWebFetcher._parse_protobuf_fields(chunk, depth + 1)
+                    except Exception:
+                        sub = None
+                fields.append((fn, wt, chunk, sub))
+
+            elif wt == 1:
+                i += 8
+                fields.append((fn, wt, None, None))
+            elif wt == 5:
+                i += 4
+                fields.append((fn, wt, None, None))
+            else:
+                break
+        return fields
 
     def _parseEmojiChatMsg(self, payload):
         '''聊天表情包消息'''
@@ -507,6 +732,8 @@ class DouyinLiveWebFetcher:
         message = ControlMessage().parse(payload)
         if message.status == 3:
             self.log("STATUS", "直播间已结束")
+            if self.on_offline:
+                self.on_offline()
             self.stop()
 
     def _parseRoomStreamAdaptationMsg(self, payload):
@@ -748,6 +975,10 @@ class DouyinLiveApp:
 
 
 if __name__ == '__main__':
-    root = tk.Tk()
-    app = DouyinLiveApp(root)
-    root.mainloop()
+    # 服务器无 GUI/tkinter 时仅打印提示，不启动图形界面（避免 AttributeError: 'NoneType'）
+    if tk is None:
+        print("未安装 tkinter，无法启动图形界面（Linux 服务器无 GUI 属正常，可用 auto_crawl.py 等脚本采集）。")
+    else:
+        root = tk.Tk()
+        app = DouyinLiveApp(root)
+        root.mainloop()
