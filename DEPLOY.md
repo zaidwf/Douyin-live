@@ -294,10 +294,22 @@ python service/pull_sessions.py --limit 0                 # 拉完积压 + 真�
 | 笔记本 | Windows 计划任务 `DouyinPull` | 30 分钟 | ② 拉顶层文本 + ③ 门禁通过后删 |
 
 ```bash
-# 服务器侧：pack.sh 后解压即得，两条命令启用
+# 服务器侧：pack.sh 后解压即得
 sudo cp /opt/douyin-live/service/douyin-archive.{service,timer} /etc/systemd/system/
-sudo systemctl daemon-reload && sudo systemctl enable --now douyin-archive.timer
+sudo cp /opt/douyin-live/service/douyin-reclaimcheck.{service,timer} /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now douyin-archive.timer douyin-reclaimcheck.timer
+sudo systemctl start douyin-archive.service          # ★ 先跑一轮，写第一个心跳（见下）
+sudo systemctl start douyin-reclaimcheck.service     # 立刻体检一次
 ```
+
+⚠️ **`start douyin-archive.service` 那一步别省**：体检的第二条判据看的是归档心跳
+`service/dist/cos_archive.beat`，**只有归档真跑过一轮才会出现**。不先跑的话，接下来 30 分钟
+体检会一直报「归档心跳不存在」—— 那是如实报警（单测里也是这么要求的：心跳文件不存在 →
+`None`，绝不当成「刚跑过」），但第一次装的人容易以为装坏了。
+
+体检本身是**只读**的（不抢锁、不写账本、不删东西），三条判据（磁盘水位 / 归档心跳 /
+账本对象活 HEAD）、阈值与边界见 `service/README.md` 第四节末。
 
 ```cmd
 :: 笔记本侧：/tr 直接起 python.exe，不经 bash —— Python 自己会设 MSYS2 的 PATH
@@ -318,13 +330,18 @@ powershell -NoProfile -Command "$s=(Get-ScheduledTask -TaskName 'DouyinPull').Se
    用户目录下的 SSH 密钥，反而更糟。**保持登录会话是前提**。
 2. **笔记本关机期间服务器磁盘照涨**：归档那条腿照跑（数据进 COS，不会丢），但删除那条腿
    停在笔记本上，`data/` 会堆。长假期回来要手动补一次 `pull_sessions.py --limit 0`。
-3. **不要用退出码做告警**：`cos_archive` 的 `0` 不证明数据在 COS（只有 `--dump-ledger -`
-   的活 HEAD 是证据），`pull_sessions` 的 `3`（撞锁）与 `1`（有场次失败）在正常轮次里
-   也会出现。笔记本侧看 `service/dist/pull_sessions.log` 的「本轮结束：成功 N、失败 M」；
-   服务器侧看 `journalctl -u douyin-archive` 与 `systemctl --failed`。
+3. **不要拿 `cos_archive` / `pull_sessions` 的退出码当「数据在 COS」的证据**：
+   `cos_archive` 的 `0` 只说明「我跑完了」（`--dump-ledger -` 的活 HEAD 才是证据），
+   `pull_sessions` 的 `3`（撞锁）与 `1`（有场次失败）在正常轮次里也会出现。
+   **链路的告警面是 `douyin-reclaimcheck.timer`**（`systemctl --failed` 里的一项），
+   它专测这件事：磁盘水位 / 归档心跳 / 账本对象此刻还在不在。人话分别在
+   `service/dist/pull_sessions.log`（笔记本）、`journalctl -u douyin-archive`
+   与 `journalctl -u douyin-reclaimcheck`（服务器）。
 
 ⏪ 回退：`schtasks /Delete /TN "DouyinPull" /F`；
-`sudo systemctl disable --now douyin-archive.timer`。两条互不影响，可以只停一条。
+`sudo systemctl disable --now douyin-archive.timer`；
+`sudo systemctl disable --now douyin-reclaimcheck.timer`。三条互不影响，可以只停一条
+（把体检停掉只是不再出声，「盘在涨 / timer 没跑 / 对象丢了」这三件事本身不会因此变好）。
 
 > ⚠️ 本地 `rsync`/`ssh` **必须同源**：都取 `D:\code\msys2-rsync\usr\bin` 下那一对
 > （调 Git 或 Windows 自带的 ssh 都有确定报错），且本地路径要写 MSYS2 的 `/d/...` 形式。

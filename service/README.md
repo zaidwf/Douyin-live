@@ -485,14 +485,23 @@ COS 上的布局，与服务器 `data/` 同构：
 |---|---|---|---|---|
 | 服务器 | `douyin-archive.{service,timer}`（**在本包里**） | 1 小时 | ① 归档到 COS | **否**（不删） |
 | 笔记本 | Windows 计划任务 `DouyinPull` | 30 分钟 | ② 拉顶层文本 + ③ 门禁通过后删 | 是 |
+| 服务器 | `douyin-reclaimcheck.{service,timer}`（**在本包里**） | 30 分钟 | **体检上面两条腿**（见下） | — |
 
 ```bash
-# 服务器侧（解压本包后就有这两个文件）
+# 服务器侧（解压本包后就有这四个文件）
 sudo cp /opt/douyin-live/service/douyin-archive.{service,timer} /etc/systemd/system/
-sudo systemctl daemon-reload && sudo systemctl enable --now douyin-archive.timer
+sudo cp /opt/douyin-live/service/douyin-reclaimcheck.{service,timer} /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now douyin-archive.timer douyin-reclaimcheck.timer
 journalctl -u douyin-archive -n 50            # 首轮就该有「已传 N 场」
-systemctl list-timers douyin-archive.timer    # 看下一次触发时刻
+systemctl list-timers douyin-archive.timer douyin-reclaimcheck.timer   # 下一次触发时刻
+systemctl start douyin-reclaimcheck.service   # 立刻体检一次（或等它自己跑）
 ```
+
+⚠️ 装完**顺手跑一轮归档**（`sudo systemctl start douyin-archive.service`）：归档体检的第二条
+判据看的是归档心跳 `service/dist/cos_archive.beat`，**这个文件只有归档真的跑过一轮才会出现**。
+不先跑一轮的话，接下来 30 分钟里体检会一直报「归档心跳不存在」—— 那是**如实**的报警，不是 bug，
+但会让第一次装的人以为装坏了。
 
 ```cmd
 :: 笔记本侧
@@ -521,8 +530,47 @@ schtasks /Query /TN "DouyinPull" /V /FO LIST | findstr /C:"上次运行结果" /
 其中 **1 场被 COS 门禁正确拦下**（`live_91430703MA4L17BU_20261016_183413` —— 归档那轮之后
 才结束的场次，COS 里还没有它 → **保留服务器那份**）。链路与保护都在真实轮次里验过了。
 
+#### ★ 链路体检（`service/reclaim_check.py`）—— 自动化**自己停摆**时谁出声
+
+自动化的危险形态不是「报错」，是「**每一步都看起来正常**」：磁盘一路涨到
+`--min-free-gb 5` 把全模态悄悄降级成纯文本，而没有任何东西报错。已有的告警面各漏一块 ——
+`douyin-healthcheck` 看的是**采集通道**（采集全绿、归档全死它照样 ok）、`★疑似漏采` 看的是
+「在播却没在采」、归档单元自己的退出码看不见「**timer 压根没跑**」（被停用/没 enable 时
+单元永远不会 failed，`systemctl --failed` 一片干净）。三条判据补这些：
+
+| 判据 | 抓的是什么 | 默认阈值 | 命中后先看 |
+|---|---|---|---|
+| ① 根盘可用空间 | **笔记本那条腿停了**（不删了）→ 磁盘只涨不落 | 10 GB | `service/dist/pull_sessions.log` 的「本轮结束」；计划任务还在不在 |
+| ② 归档心跳 `service/dist/cos_archive.beat` 的年龄 | 归档 timer **根本没在跑** | 150 分钟 | `systemctl status douyin-archive.timer` |
+| ③ 账本说已归档、COS 上对象**此刻还在不在** | ★ **静默丢失**（唯一副本没了） | —（二元） | `cos_archive.py --selftest`，再 `--dump-ledger -` |
+
+**① 为什么能替笔记本那条腿说话**：删除只在笔记本上做（三道门禁在那边），服务器看不到它的
+死活 —— 但「不删」的直接后果就是**磁盘只涨不落**，于是一条磁盘判据覆盖两条腿，不必去猜
+笔记本的状态。代价是**慢**：从 25 GB 掉到 10 GB 约 5 小时（实测流入 2.86 GB/小时）。
+
+**③ 为什么非做不可**：`cos_archive` 的 HEAD 复查排在 `if not todo: return EXIT_OK` **之后**
+（本文件上面「三条不能破的约定」里那条 `--dump-ledger -` 的说明就是讲这个）—— 在日常的
+「没有新场次要传」场景里，服务器**一次 HEAD 都不做**就返回 0。桶被清空、生命周期到期、
+有人手工删过对象：账本照旧写着 `verify='ok'`、`plan_cycle()` 照旧判 `done` 并永远跳过，
+直到笔记本**准备删它**那一刻才发现。③ 把这个发现时机从「下次要删它」提前到「每 30 分钟」。
+
+```bash
+./venv/bin/python service/reclaim_check.py                  # 体检一次（0 健康 / 1 有告警）
+./venv/bin/python service/reclaim_check.py --min-free-gb 15 # 换磁盘告警线
+cat service/dist/reclaim.json                               # 结构化状态（--json-out '' 可关）
+```
+
+三条边界，都是**故意的**：
+1. **③ 只核对「服务器上还在」的场次** —— 账本是累积的（删掉一场，记录仍留着），全量 HEAD
+   会随天数线性变重；而已经删掉的那些，删除当时已用同一条判据当场核过。
+2. **它不替代 `--dump-ledger -`** —— 那个是「**允不允许删**」的当场正向证据（fail-closed、
+   逐批 TOCTOU 重取），本工具是「**有没有出事先吱一声**」的巡检；判定「对象在不在」用的是
+   **同一个** `Cos.size_of()`，不另写一份。
+3. **它不证明数据内容对** —— 逐字节核验在归档轮（`verify_tar` 对 manifest）与笔记本的删除
+   门禁（文本腿 manifest）里。它只管「对象在、字节数与账本一致」。
+
 ⏪ 回退互不影响，可以只停一条：`sudo systemctl disable --now douyin-archive.timer` /
-`schtasks /Delete /TN "DouyinPull" /F`。
+`sudo systemctl disable --now douyin-reclaimcheck.timer` / `schtasks /Delete /TN "DouyinPull" /F`。
 
 ## 五、5 主播并发全模态测试
 

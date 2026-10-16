@@ -66,9 +66,14 @@ python test/test_pull_sessions_unit.py                  # 选场/三道门禁/�
 ./venv/bin/python service/cos_archive.py --dump-ledger -         # ★只读：账本 + 逐条活 HEAD → object_present
 python test/test_cos_archive_unit.py                    # 签名/凭据不回显/选场/tar 校验/契约（离线）
 
-# ↓ 两条自动触发（2026-10-16 起，见「两条腿」那节的 ★）
+python service/reclaim_check.py                        # 回收链路体检一次（0 健康 / 1 有告警）
+python service/reclaim_check.py --min-free-gb 15       # 换磁盘告警线（默认 10 GB）
+python test/test_reclaim_check_unit.py                 # 三条判据的真值表 + 心跳契约（离线）
+
+# ↓ 三条自动触发（2026-10-16 起，见「两条腿」那节的 ★）
 sudo cp /opt/douyin-live/service/douyin-archive.{service,timer} /etc/systemd/system/
-sudo systemctl daemon-reload && sudo systemctl enable --now douyin-archive.timer
+sudo cp /opt/douyin-live/service/douyin-reclaimcheck.{service,timer} /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now douyin-archive.timer douyin-reclaimcheck.timer
 schtasks /Create /TN "DouyinPull" /SC MINUTE /MO 30 /F /TR "\"<python.exe>\" \"<repo>\service\pull_sessions.py\" --no-cos --quiet"
 #    ↑ 笔记本这条**必须带 `--no-cos`**（否则和服务器 timer 抢锁空转），
 #      且装完必须关掉电池限制（默认「用电池时不启动」，笔记本一拔电源链路就断）
@@ -168,6 +173,7 @@ python service/run_5anchors.py --anchors 5 --duration 600   # 5 主播并发全�
 |---|---|---|---|
 | 服务器 | `douyin-archive.timer`（**在部署包里**） | 1 小时 | ① 归档到 COS（**不删**） |
 | 笔记本 | Windows 计划任务 `DouyinPull` | 30 分钟 | ② 拉顶层文本 + ③ 门禁通过后删 |
+| 服务器 | `douyin-reclaimcheck.timer`（**在部署包里**） | 30 分钟 | **体检上面两条腿**（见下） |
 
 **分工不是随便定的**：① 走内网 59 MB/s、公网只有 0.33 MB/s，**只有它必须在服务器上做**；
 而**删除必须由笔记本发起**（三道门禁只在笔记本上，`pull_sessions.py` 里
@@ -186,6 +192,31 @@ python service/run_5anchors.py --anchors 5 --duration 600   # 5 主播并发全�
 首次两轮实测：服务器首轮归档 4 场 / 0 失败 / 26 秒；笔记本首轮「成功 5、失败 0」，
 其中**1 场被 COS 门禁正确拦下**（20:04 归档之后才结束的场次，COS 里还没有它 → 保留
 服务器那份）—— 门禁在真实轮次里做了一次正确拦截，链路与保护都验过了。
+
+**★ 回收链路体检 `service/reclaim_check.py` + `douyin-reclaimcheck.timer`（30 分钟）**：
+自动化的危险形态不是「报错」而是「**每一步都看起来正常**」—— 磁盘一路涨到
+`--min-free-gb 5` 悄悄把全模态降级成纯文本，没有任何东西会出声。已有的告警面各漏一块：
+体检（探通道+产出）看不到「数据进没进 COS」；`★疑似漏采` 看不到；归档单元自己的退出码
+**看不见「timer 压根没跑」**（被停用/没 enable 时单元永远不会 failed，`--failed` 一片干净）。
+三条判据补这些（任一命中 → 退出 1；`systemctl --failed` 就是告警面）：
+
+| 判据 | 抓的是什么 | 默认阈值 |
+|---|---|---|
+| ① 根盘可用空间 | **笔记本那条腿停了**（不删了）→ 磁盘只涨不落。它是两条腿的**联合**指标 —— 删除只在笔记本上做，服务器看不到它的死活，但「不删」的直接后果就是磁盘不降 | 10 GB |
+| ② 归档心跳 `service/dist/cos_archive.beat` 的年龄 | 归档 timer **根本没在跑** | 150 分钟（连丢两轮） |
+| ③ 账本说已归档、COS 上对象**此刻还在不在** | ★ **静默丢失**（唯一副本没了） | 无（二元） |
+
+⚠️ **③ 非做不可**：`cos_archive` 的 HEAD 复查排在 `if not todo: return EXIT_OK` **之后**
+—— 在日常的「没有新场次要传」场景里服务器**一次 HEAD 都不做**就返回 0（见上面那条）。
+③ 只核对「**服务器上还在**」的场次（账本会累积，全量 HEAD 随天数线性变重；已删场次在删除
+当时已当场核过）。判「对象在不在」用的是**同一个** `Cos.size_of()`，不另写一份。
+⚠️ **心跳只由 `_cycle` 写**（在 `load_cos_env()` 之前，答的是「跑起来没」不是「成功没」），
+`--dump-ledger` / `--selftest` **不写** —— 笔记本每 30 分钟就调一次 `--dump-ledger`，
+那也写心跳的话 timer 早死了也看不出来（单测钉住）。
+⚠️ 它**不替代** `--dump-ledger -`（那个是「允不允许删」的当场正向证据，fail-closed + TOCTOU），
+也**不证明数据内容对**（逐字节核验在归档轮与删除门禁里）。
+⚠️ 体检 timer 的 `OnBootSec=20min` **必须晚于归档的 10min**：早于它跑，每次重启都会假报
+「归档心跳不存在」，报几次就没人看了（单测钉住这个次序）。
 
 **控制面代理**（`DOUYIN_PROXY`，服务器上必配）：只覆盖控制面的 **HTTP**（4 处 `requests`），
 444 打在页面/enter/ranklist 这些端点上；ffmpeg 拉 FLV **默认直连**（CDN 是另一套
