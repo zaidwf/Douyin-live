@@ -648,7 +648,15 @@ message HeadersList {
 message LiveShoppingMessage {
   Common common = 1;
   int32 msgType = 2;
-  int64  promotionId = 4;
+  int64  promotionId = 3;
+}
+
+message LiveEcomGeneralMessage {
+  Common common = 1;
+  string type = 2;
+  string contentType = 3;
+  int64 timestamp = 4;
+  bytes bizContent = 6;
 }
 
 message RoomStatsMessage {
@@ -690,6 +698,18 @@ message ProductChangeMessage {
   repeated ProductInfo updateProductInfoList = 4;
   int64 total = 5;
   repeated CategoryInfo updateCategoryInfoList = 8;
+}
+
+// 讲解状态消息：Extra.active 表示该商品是否正在讲解（比 ProductInfo.explainType 更直接）
+// from https://github.com/.../douyinlive-proto/blob/main/protobuf/new_douyin.proto
+message AwemeShopExplainMessage {
+  Common common = 1;
+  Extra extra = 2;
+
+  message Extra {
+    uint64 promotionId = 1;
+    bool active = 2;
+  }
 }
 
 // from https://github.com/HaoDong108/DouyinBarrageGrab/blob/main/BarrageGrab/proto/message.proto

@@ -1,0 +1,107 @@
+[Unit]
+Description=Douyin Live Auto Crawl (daemon)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/douyin-live
+ExecStart=/opt/douyin-live/venv/bin/python /opt/douyin-live/auto_crawl.py \
+          /opt/douyin-live/documents/huitun_10_100w_1015_final.xlsx 60 \
+          --media --max-sessions 10 --max-media 10 --min-free-gb 5
+Restart=always
+RestartSec=30
+Environment=PYTHONUNBUFFERED=1
+
+# 代理凭据从**这个文件**读，而不是写在上面那行 Environment= 里 ——
+# 写了就等于把账密提交进 git（本文件是受版本控制的）。config/ 已在 .gitignore 中。
+# 行首的 `-` = **文件不存在也不报错**：没配代理时服务照常起来（= 直连，即改动前行为）。
+# 建法见 service/README.md：
+#   printf 'DOUYIN_PROXY=http://<用户>:<密码>@<主机>:<端口>\n' > /opt/douyin-live/config/proxy.env
+#   chmod 600 /opt/douyin-live/config/proxy.env
+# ★ 只影响**控制面的 HTTP**（页面/enter/ranklist）。**WebSocket 默认不走隧道**
+#   —— 隧道在 ~6.5 分钟处掐断长连接，实测把一场直播切成多个碎片场次（见
+#   liveMan.WS_PROXY_ENV 与 config/proxy.env.example 里的三组对照表）。
+#   要恢复走隧道：在 config/proxy.env 里加一行 `DOUYIN_WS_PROXY=1`。
+# ffmpeg 拉 FLV 也是直连，除非另外设 DOUYIN_STREAM_PROXY。
+EnvironmentFile=-/opt/douyin-live/config/proxy.env
+
+# 日志交给 journald（自带轮转）。**不要改成 append:/path/crawl.log** ——
+# 守护进程按 60s 一轮持续打印，append 模式永不轮转，几个月就能把磁盘写满。
+# 查看：journalctl -u douyin-crawl -f
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=douyin-crawl
+
+# data_recorder 每场持 4 个常开句柄，ulimit -n 默认常是 1024（约 250 场同时采就到顶）
+LimitNOFILE=65535
+
+# 优雅退出的预算：auto_crawl 收到 SIGTERM 会先让当前场次落盘再退（见 auto_crawl.py
+# 的 _install_signal_handlers）。60s 足够收尾；留太短会被 systemd 直接 SIGKILL，
+# 那等于回到「重启就丢当前场次」。
+TimeoutStopSec=60
+
+# ── ExecStart 的四个开关都是有理由的，改动前先读完 ──
+#
+# --media              全模态（帧 + 16kHz 单声道 WAV）。默认关是因为开销由**带宽+内存**
+#                      主导、不能线性外推（实测单路 0.023 核 / 162 MB / 6.2 Mbps）。
+# --max-sessions 10    ★ **这条是「只并发采 10 个主播」的实现**（2026-10-16 的策略调整）。
+#                      它是**非阻塞**的：抢不到名额的主播**这一轮完全不采** —— 不建场次
+#                      目录、不连 WS、不落任何数据，只保留开播状态探测（由台账记录）。
+#                      语义和 --max-media 相反（那个是排队等）。
+#                      ⚠️ 改了这里的 10，**douyin-ledger.service 的 `--max-sessions` 要
+#                      跟着改**：台账靠这个值把「名额满了没轮到」和「真漏采了」分开，
+#                      不一致会让 `疑似漏采` 误报、退出码恒为 1。
+# --max-media 10       **必须在**。一主播一线程、媒体在主播线程内联锁采完整场，没有天然
+#                      上限 —— 157 人名单里有几个在播就同时起几路 ffmpeg，2C2G 会直接崩。
+#                      有了 --max-sessions 之后它其实是第二道闸：同时最多 10 个场次、
+#                      每场最多一路 ffmpeg，所以它**永远轮不到阻塞**。留着是为了
+#                      「万一有人把 --max-sessions 调大」时这层保护还在。
+#
+#                      为什么是 10（2026-10-16 在**新机**上实测，不是外推）：单路 = **111 MB**
+#                      （`ps -o rss= -C ffmpeg`，10 路合计 1114 MB），10 路满载时
+#                      `available` = **536 MB**，cgroup 1143 MB → 扣 200 MB 安全垫还能再加
+#                      ≈3 路。带宽侧 100 Mbps ÷ 6.2 Mbps ≈ 16 路，所以**内存先撞**。
+#                      这已经压着线了 —— 这是台 **无 swap** 的 2C2G，超了就是 OOM killer，
+#                      救不回来。**别再加，要加先加内存**。
+#                      （旧机同配置实测是 89 MB/路 / available 773 MB，所以当时算出的
+#                      上限 ≈11；两台机器房间构成不同，以新机这个 111 MB 为准。）
+#                      2026-10-15 之前是 5：那时名额还会被「早已下播的僵尸会话」吃掉
+#                      （见 auto_crawl._wait_media_slot），5 个名额里多数喂给了空房间，
+#                      **提高上限只会喂饱更多僵尸**。修完之后 5 个名额才真正用满。
+# --min-free-gb 5      磁盘保护：剩余空间低于 5 GB 就不再起新 ffmpeg，那一场降级为纯文本/
+#                      数值，空间回收后自动恢复。**这不是可选项** —— 40G 盘不设这个
+#                      一两天就写满，daemon 会开始报错并在强杀时留下没有 room.json 的
+#                      残缺场次。而文本+数值每场只占 ~200 KB，降级几乎不损失研究价值。
+#                      0 = 关闭（不推荐）。
+#
+#                      ⚠️ **2026-10-16 在新机上实测：≈ 2.86 GB/小时 ≈ 68.6 GB/天**
+#                      （5 分钟窗口 244 MB，`du` 量的是 data/ 本体）。构成：音频 ≈ 1.18 GB/时
+#                      （30 秒一段 × 32 KB/s），帧 ≈ 1.7 GB/时 —— **实测 265 KB/帧**，
+#                      远大于文档里估的 25 KB，因为那是原始分辨率的 `-q:v 2` JPEG。
+#                      所以 40G 盘从 29 GB 可用到这个 5 GB 阈值只有**约 8.4 小时**。
+#                      **这个开关只保证「不写满」，不保证「能一直采全模态」** ——
+#                      要长期采音视频得清 data/、降帧率/画质，或扩盘。剩余空间由
+#                      douyin-healthcheck 每 10 分钟报一次（journalctl -u douyin-healthcheck -n 5）。
+#
+# 只想要纯文本（不采音视频）：去掉 --media 即可，另外三个随之失效。
+# 换名单：改这行的 xlsx 路径，然后 `systemctl restart douyin-crawl`（名单只在启动时读一次）。
+#
+# ── 还有一个**改变了行为**、但刻意没写进 ExecStart 的默认值 ──
+#
+# --ws-reconnect 10（默认值；`--stall-sec` 同理，也是用默认的 300）
+#                      WS 断线后在**同一个场次目录**里自动重连，最多**连续** 10 次
+#                      （某条连接活过 15 秒即清零重计，所以「每 10 分钟断一次」的长直播
+#                      能一直重连下去，只有「一连就挂」才计数耗尽）。
+#                      ★ 没有它的话「断一次 = 一个场次」：一场真实直播会被切成多个
+#                      「完整」碎片场次（实测同一主播 30 分钟内 4 个），而台账里标的
+#                      「完整」是**碎片完整** —— 按场次聚合的特征（时长、峰值人气、
+#                      整场弹幕量、留存）会在碎片边界上被切断。
+#                      要退回旧行为：在 ExecStart 里加 `--ws-reconnect 0`（不用改代码）。
+#                      现场是否真在重连，看场次目录里 `session_meta.json` 的
+#                      `ws_reconnects` / `ws_gap_s`（WS 直连后实测长期为 0；
+#                      持续 > 0 说明出现了**新的断因**，是告警信号）。
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,18 @@
+[Unit]
+Description=Run Douyin Live reclaim-chain check every 30 minutes
+
+[Timer]
+# 开机 20 分钟后先跑一次。**故意排在归档 timer（OnBootSec=10min）之后**：
+# 那一个跑完才会写下第一个心跳，早于它跑的话第一次检查必然报「归档心跳不存在」——
+# 每次重启都来一次假告警，报几次就没人看了（这正是 health_check 顶部讲的那件事）。
+OnBootSec=20min
+# 之后每 30 分钟一次。周期选择：三条判据的阈值都是**小时**量级（心跳 150 分钟、
+# 磁盘按小时计），30 分钟足够在演变成「停机半天」之前发现，同时把成本钉住 ——
+# 一轮要 HEAD 一遍在服务器上还留着的场次数，跑太勤只是反复问同一批对象。
+OnUnitActiveSec=30min
+# 关机期间错过的检查，开机后补跑一次。对本单元尤其重要：关机本身就会让磁盘少回收一段，
+# 开机时正该立刻知道当前水位。
+Persistent=true
+
+[Install]
+WantedBy=timers.target

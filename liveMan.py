@@ -44,6 +44,190 @@ COMMON_HEADERS = {
 }
 
 
+# ---------------------------------------------------------------------------
+# 代理（**只作用于控制面**：4 处 HTTP + WebSocket）
+#
+# 为什么只给控制面：444 风控打在「直播页 HTML / enter / ranklist」这些端点上
+# （DEPLOY.md 第七节实测：数据中心 IP 15 主播 @10s 就有 88 次 444）。而 FLV 是 CDN 的
+# 另一套域名，通常不受同一套风控；且一路媒体流 ~6.2 Mbps，5 路 ≈ 31 Mbps，全程穿隧道
+# 既计费又可能撞隧道带宽上限 —— 没必要就不走。
+#
+# 若实测发现 CDN 也被 IP 拦截（现象：控制面正常、但 `MediaCapture` 起不来 ffmpeg），
+# 单独设 `DOUYIN_STREAM_PROXY` 给 ffmpeg 开（见 `MediaCapture._proxy_args`），
+# **不要**顺手把控制面这份也改掉。
+#
+# 配置优先级：DOUYIN_PROXY > http_proxy / HTTP_PROXY > 无（无 = 直连，行为与改动前一致）
+#
+# ★ 2026-10-16：**WebSocket 默认不再走隧道**（单独开关见 `WS_PROXY_ENV`）。
+# 上面那句「444 也打在 WS 建连上」是 2026-10-15 的结论，但那天**所有**控制面流量都在
+# 隧道里，把「隧道掐长连接」误当成了「WS 被 444」。三组对照实测（同一台服务器、同一
+# 时刻、同一批在播主播，唯一变量是走不走隧道）推翻了它：
+#
+#   | 组     | 条数 | 结果                                              |
+#   |--------|------|---------------------------------------------------|
+#   | 走隧道 | 2    | 389.1s / 456.5s **双双被掐**（`Connection to     |
+#   |        |      | remote host was lost.`，死前还在收帧 702/870）    |
+#   | 直连   | 2    | 1051s **仍活着**                                   |
+#   | 直连   | 10   | **9 条活满 1200s 上限、零 ERROR**；第 10 条   |
+#   |        |      | 574.6s **正常下播**（`offline`，不是被掐）    |
+#   | 直连   | 2    | 活满 900s 上限，2231/2310 帧，**零 ERROR**         |
+#
+# 同期生产（走隧道）70 分钟里 108 次 `WebSocket错误`，而 14 条直连 WS **一次 444 都没有**。
+# 隧道在 ~6.5 分钟处掐断长连接、每条各自死（85 条 `ws_closed` 里同秒死亡 **0** 次、
+# ≤2 秒成批 **0** 组；并发 10 路与 1–2 路的中位存活同为 ~375s）。
+#
+# 后果不只是「少采一点」，而是**一场真实直播被切成多个「完整」碎片场次**
+# （实测同一主播 30 分钟内 4 个场次目录）—— 台账里的「完整」是碎片完整。
+#
+# 所以 WS 走直连、HTTP 仍走隧道：怕 444 的是页面/enter/ranklist 这些**短请求**
+# （直连实测确实会 444，那才是当初加代理的原因），而**长连接**恰恰是隧道唯一搞不定的东西。
+# 实测直连的短请求也没被 444 打 —— 但那是隧道在替它挡，所以**不动** `proxy_for_requests()`。
+#
+# 要退回「WS 也走隧道」（隧道换供应商后想 A/B）：设 `DOUYIN_WS_PROXY=1`，不用改代码。
+# ---------------------------------------------------------------------------
+PROXY_ENV_KEYS = ("DOUYIN_PROXY", "http_proxy", "HTTP_PROXY")
+
+# WS 是否走隧道。**默认关**（= 直连），设成非空且不是下面这些假值才开。
+WS_PROXY_ENV = "DOUYIN_WS_PROXY"
+_WS_PROXY_OFF = ("", "0", "no", "off", "false")
+
+
+def parse_proxy(url):
+    """把 `http://<用户>:<密码>@<主机>:<端口>` 拆成各处能直接用的形状；空/None 返回 None
+
+    :return: `{"url", "host", "port", "auth"}`，`auth` 是 `(user, pass)` 或 None
+    :raises ValueError: 非 http/https，或没有主机名（**明确报错，不静默降级成直连**）
+
+    ⚠️ 只支持 http/https。socks5 需要 PySocks，且 websocket-client 走的是
+    `proxy_type='socks5'` 另一条分支 —— 本项目当前用不到，宁可报错也不静默走错。
+    """
+    if not url or not str(url).strip():
+        return None
+    u = str(url).strip()
+    if "://" not in u:
+        u = "http://" + u          # 容忍省略 scheme 的 `host:port` / `user:pass@host:port`
+    sp = urllib.parse.urlsplit(u)
+    if sp.scheme not in ("http", "https"):
+        raise ValueError(f"只支持 http/https 代理，收到 scheme={sp.scheme!r}（{url!r}）")
+    if not sp.hostname:
+        raise ValueError(f"代理地址里没有主机名: {url!r}")
+    # 用户名/密码要 unquote：凭据里出现 %xx 是常态（本次这个恰好是纯 hex，但不能假设）
+    auth = None
+    if sp.username is not None:
+        auth = (urllib.parse.unquote(sp.username),
+                urllib.parse.unquote(sp.password or ""))
+    return {"url": u, "host": sp.hostname,
+            "port": sp.port or (443 if sp.scheme == "https" else 80),
+            "auth": auth}
+
+
+_PROXY_CFG = None         # 进程内解析一次
+_PROXY_RESOLVED = False   # 测试钩子：置回 False 可让下次调用重新读环境
+
+
+def _proxy_cfg():
+    """惰性解析一次并缓存 —— 代理是进程级配置，中途不会变，不必每请求读环境"""
+    global _PROXY_CFG, _PROXY_RESOLVED
+    if not _PROXY_RESOLVED:
+        url = None
+        for k in PROXY_ENV_KEYS:
+            v = os.environ.get(k)
+            if v and v.strip():
+                url = v.strip()
+                break
+        _PROXY_CFG = parse_proxy(url)
+        _PROXY_RESOLVED = True
+    return _PROXY_CFG
+
+
+def proxy_for_requests():
+    """`requests.get(..., proxies=proxy_for_requests())` 的实参
+
+    未配置时返回 **空 dict**（= 确定直连）。⚠️ 不能返回 `None` —— `None` 会让 requests
+    回落到自己读 `http_proxy` 环境变量，而那几个变量上面已经读过一遍了；传 `{}` 才能让
+    「走不走代理」只由 `_proxy_cfg()` 这一处决定，行为可复现。
+    """
+    c = _proxy_cfg()
+    return {"http": c["url"], "https": c["url"]} if c else {}
+
+
+def ws_proxy_enabled():
+    """WS 要不要走隧道。**默认 False**（= 直连），见 `WS_PROXY_ENV` 上面那段实测
+
+    读环境**不缓存**：`ws_proxy_enabled` 决定的是「新建的连接往哪走」，
+    进程活着的这几小时里隧道可能被换掉/掐死，让运维能改 env 后立刻生效
+    （`proxy_for_ws()` 每条连接才调一次，这点开销可忽略）。
+    """
+    v = (os.environ.get(WS_PROXY_ENV) or "").strip().lower()
+    return v not in _WS_PROXY_OFF
+
+
+def proxy_for_ws():
+    """`self.ws.run_forever(**proxy_for_ws())` 的实参
+
+    ★ **默认返回 `{}`（直连），即使配了 `DOUYIN_PROXY`** —— 隧道会掐长连接，
+    见 `WS_PROXY_ENV` 上面那段的实测。要恢复「WS 也走隧道」设 `DOUYIN_WS_PROXY=1`。
+
+    ⚠️ 真要传代理参数时，websocket-client **不认** `http_proxy` 环境变量
+    （requests 认、它不认），必须显式传这些参数，否则 WS 会静默绕过代理直连。
+
+    ⚠️ **`proxy_type` 必须显式给**，否则必报
+    `Only http, socks4, socks5 proxy protocols are supported`（实测踩过）：
+    `run_forever` 的默认签名是 `proxy_type=None`，而它把该值**原样**塞进 options，
+    下游 `proxy_info` 用的是 `options.get("proxy_type", "http")` —— key 存在但值为 None
+    时 `.get` 的默认值**不生效**，于是 `None not in [http, socks4, ...]` 直接抛错。
+    传 `"http"` 才是那个「默认值」真正生效的写法。
+    """
+    c = _proxy_cfg()
+    if not c or not ws_proxy_enabled():
+        return {}
+    return {"http_proxy_host": c["host"], "http_proxy_port": c["port"],
+            "http_proxy_auth": c["auth"], "proxy_type": "http"}
+
+
+RISK_444_TAG = '[风控444]'          # 稳定标记，打在所有被 444 的日志行上
+_444_LEGACY = '444 Client Error'    # requests 的报错措辞（旧口径，仅用于兼容历史日志）
+
+
+def is_risk_control_444(text):
+    """该日志行/消息是否是抖音的 **HTTP 444 风控命中**
+
+    ⚠️ **不要退回子串匹配 `"444" in text`**。实测（2026-10-15）：那样会把 user_id、
+    时间戳里恰好含 `444` 的行全算成风控命中 —— 一个干净窗口里 naive 口径数出 **50** 行，
+    而真 444 只有 **0** 行，凭空造出一个「≈12% 残余风控」的假结论。
+
+    两个来源都认：
+      1. `RISK_444_TAG` —— 本模块按 `err.response.status_code == 444` 打的标记（**首选**，
+         不依赖 requests 的英文措辞，语言/版本/时区都改不动它）
+      2. `_444_LEGACY` —— 历史日志里 requests 抛出的原文，用于回溯旧数据
+    """
+    if RISK_444_TAG in text:
+        return True
+    return _444_LEGACY in text
+
+
+def err_text(err):
+    """把请求异常渲染成日志文本；**是 444 就附上稳定标记**
+
+    按 `status_code` 判、不按文本判：444 在 HTTP 里没有 reason phrase，requests 会拼成
+    `444 Client Error:  for url: …`（中间两个空格，出自空 phrase）—— 依赖这个措辞等于把
+    「风控统计」绑死在 requests 的英文格式上。按状态码判，语言/版本/时区都改不动它。
+    """
+    if getattr(getattr(err, 'response', None), 'status_code', None) == 444:
+        return f"{err} {RISK_444_TAG}"
+    return str(err)
+
+
+def stream_proxy_url():
+    """ffmpeg 拉 FLV 用的代理 URL；默认 None = **直连**（理由见上方注释块）
+
+    刻意不与控制面共用 `DOUYIN_PROXY`：两者该不该走代理是**独立**的问题，
+    绑在一起会导致「为了修 CDN 而把控制面也塞进隧道」这类误操作。
+    """
+    v = os.environ.get("DOUYIN_STREAM_PROXY")
+    return v.strip() if v and v.strip() else None
+
+
 @contextmanager
 def patched_popen_encoding(encoding='utf-8'):
     original_popen_init = subprocess.Popen.__init__
@@ -213,9 +397,70 @@ def extract_stream_urls_from_html(html):
     return []
 
 
+def extract_stream_urls_from_enter(data):
+    """从 `_enter_api()` 的返回值解析 flv_pull_url（多画质 FLV 流）
+
+    与 `extract_stream_urls_from_html` 是**同一条数据的两个来源**：结构都是
+    `stream_url.flv_pull_url`（字典，键 FULL_HD1/HD1/SD1/SD2），都按 `flv.values()`
+    取值，所以**画质顺序一致**，`MediaCapture.url_index` 在两条路径上语义相同。
+
+    存在的理由（2026-10-14 实测）：直播间**页面端点**（`https://live.douyin.com/<id>`）
+    在密集请求后会下发**验证码中间页** —— HTTP 200、6297 字节、含
+    `sec_sdk_build/3.5.2/captcha/index.js`，**没有** `flv_pull_url`/`roomId`。
+    实测是 **IP 级**限制（换新 ttwid 无效、所有房间同时中招），且**只针对页面端点**：
+    enter 接口与 WS 全程正常。此时页面路径返回 `[]`，音视频采集直接归零（生产实测
+    `collect_full.py` 图像 0 帧 / 音频 0 段）。此函数即该情况下的回退来源。
+
+    :param data: `_enter_api()` 的返回值（响应里的 `data` 对象）
+    :return: 流地址列表（多个画质，顺序同 HTML 路径），解析不到返回 []
+    """
+    try:
+        rooms = (data or {}).get('data') or []
+        flv = ((rooms[0].get('stream_url') or {}).get('flv_pull_url') or {})
+        return [u for u in flv.values() if u]
+    except Exception:
+        return []
+
+
 # 长会话看护：FLV 流地址会过期，检查间隔与最多续采次数
 MEDIA_WATCHDOG_INTERVAL = 30
 MEDIA_MAX_RESTARTS = 20
+
+
+# ── WS 断线自动重连（2026-10-16，用在 `DouyinLiveWebFetcher.start`）──────────
+#
+# 为什么要有它：WS 一断，`auto_crawl` 就把本场收尾、60 秒后**另开一个场次目录** ——
+# 于是一场真实直播被切成多个「完整」碎片场次（实测同一主播 30 分钟内 4 个），
+# 台账标的「完整」变成**碎片完整**，任何按场次聚合的研究特征（时长、峰值人气、
+# 整场弹幕量、留存）都会在碎片边界上被切断。重连让「一场直播 = 一个场次目录」
+# 重新成立，断线只丢几秒数据而不是把一场变成两场。
+#
+# ★ **默认不重连**（`start(max_reconnects=0)`）：`collect_full.py` / GUI /
+#   `load_test.py` / `run_ladder.py` 都依赖「WS 线程死了 = 这场完了」的语义，
+#   改了会把压测的失败计数掩盖掉（`load_test` 更是拿 `f.running = False` 当**唯一**
+#   的停止手段，重连会把它吞掉）。只有 `auto_crawl`（生产守护）显式打开。
+RECONNECT_WAIT = 3.0            # 每次重连前的退避等待（秒）
+RECONNECT_GRACE = 15.0          # 连接活过这么久 = 「真连上并采到数据了」，连续失败计数清零
+HEARTBEAT_JOIN_TIMEOUT = 6.0    # ★ 必须 > `_sendHeartbeat` 的 time.sleep(5)，否则 join 恒超时
+
+
+def next_reconnect_state(lived_s, fails, max_reconnects, grace=RECONNECT_GRACE):
+    """一条 WS 连接结束后该不该再连一条 → `(是否重连, 新的连续失败计数)`
+
+    抽成模块级纯函数是为了**可单测**（同 `auto_crawl._stalled` 的写法）—— 循环本身要喂
+    「连了多久、连了几次」这些时间相关的状态，内联在 `start()` 里没法测。
+
+    口径是**连续**失败而不是累计：`lived_s >= grace` 说明这条连接真采到数据了，额度
+    **恢复**（fails 清零）。于是「每 10 分钟断一次」的长直播能一直重连下去，而「一连就
+    挂」才会计数耗尽 —— 后者通常意味着房间已下播 / 被风控，重试本来也没用。
+
+    `max_reconnects=2` 的行为（每次都是秒断）：重连 2 次后放弃；若中途有一条连接活过
+    `grace`，计数清零、重新给满 2 次。
+    """
+    if max_reconnects <= 0:
+        return False, fails          # 不重连 = 改动前行为
+    fails = 0 if lived_s >= grace else fails + 1
+    return fails <= max_reconnects, fails
 
 
 class MediaCapture:
@@ -238,28 +483,71 @@ class MediaCapture:
         librosa-OpenSMILE 直接使用；**不要改回 mp3**。
       - 图像 `frames/frame_%04d.jpg`：ffmpeg 直解 FLV，**原始分辨率、无 scale**、
         无浏览器缩放/黑边/UI 叠加 —— 这是相对 Playwright `video.screenshot()` 的本质改善。
+        **抽帧间隔自 2026-10-14 起由 10s 改为 5s**（`frame_interval=5`）。
+        ⚠️ **本仓库 2026-10-14 之前采集的场次都是 10s 一帧**，而 `room.json`
+        **不记录抽帧间隔** —— 新旧语料混用时只能靠「帧数 ÷ 场次时长」反推。
+        改这个值不影响带宽与 CPU（实测：拉流与解码都不依赖出帧频率，
+        `fps` 滤镜只决定解码完的帧写不写盘），只影响帧数量与磁盘。
 
-    ⚠️ **并发成本**：一路主播 = 2 个 ffmpeg 进程，视频软解约 0.5-1 核，
-    **100 路 ≈ 50-100 核**、磁盘约 20-30 GB/小时。单机带不动 100 路音视频，
-    故 `auto_crawl` 侧是显式开关且**默认关**。
+    ⚠️ **并发成本（2026-10-14 实测，非估算）**：
+
+    默认路径是**合并单进程 + `-skip_frame nokey`**（2026-10-14 起），一路 = 1 个 ffmpeg：
+    **0.023 核 CPU / 125 MB RSS / 6.2 Mbps 带宽**。
+
+    三个杠杆的实测依据：
+      - **合并单进程**（`merged=True`）：`-vn` **不省带宽** —— 音频进程仍要读完整条复用
+        FLV，实测音频档与视频档带宽完全相同（各 6.2 Mbps）。拆两个进程 = 把同一条流
+        **读两遍**，一路占 `2 × 流码率`。合并后只读一遍 → 带宽 ÷2、进程 ÷2、RSS ÷2。
+      - **`-skip_frame nokey`**（放 `-i` 之前）：只解关键帧，视频 CPU `0.161 → 0.013` 核、
+        RSS `209 → 116 MB`，**产出帧数不变**。实测抖音流 **GOP = 2.0s**，密于 5s 抽帧
+        间隔，故是「挑帧」不是「补帧」，不会写出重复 JPG（副作用：画面最多偏 ±1s）。
+      - **抽帧频率/音频段长不是杠杆**：fps=1/10 与 fps=1/300 的带宽与 CPU **完全相同**
+        （0.79 MB/s / 0.166 核）—— CPU 在**解码**上，`fps` 滤镜只决定写不写盘。
+
+    瓶颈**不是 CPU 而是带宽与内存**：合并后按 0.023 核/路，16 逻辑核能带几十路；但一路
+    仍要 6.2 Mbps，链路吞吐 ÷ 6.2 Mbps 才是真实路数。实测本机 Wi-Fi（标称 144 Mbps）
+    真实可用吞吐仅 ~4 MB/s ≈ 32 Mbps。**2 核 2G 服务器**：内存 1710 MB ÷ 127 ≈ 13 路、
+    CPU ≈ 11 路、100 Mbps 口 ≈ 16 路 → **可持续 ≈ 11-13 路**（优化前约 5 路）。
+    磁盘不是约束（5s/帧口径下：WAV 32 KB/s + 帧 ~64 KB/s ≈ 0.10 MB/s/路）。
+    故 `auto_crawl` 侧仍是显式开关且**默认关**，`--media` 只适合小规模验证。
+    完整阶梯与标定见 `modify.md` 的 2026-10-14 条目。
     """
 
-    def __init__(self, live_id, out_dir, *, fetcher=None, want_audio=True,
-                 want_frames=True, audio_segment=30, frame_interval=10,
-                 max_seconds=None, log=print):
+    def __init__(self, live_id, out_dir, *, fetcher=None, url_index=0, want_audio=True,
+                 want_frames=True, audio_segment=30, frame_interval=5, merged=True,
+                 max_seconds=None, stream_proxy=None, log=print):
         """
         :param fetcher: `DouyinLiveWebFetcher` 实例，用于复用其 ttwid/cookie 与页面请求
         :param out_dir: 落盘目录（传 `DataRecorder.path`），内部再建 `audio/` `frames/`
+        :param url_index: 取第几个画质档的流地址（`flv_pull_url` 有 4 档：uhd/hd/ld/sd，
+            实测 1080×1920@45fps 6Mbps）。**默认 0 = 最高画质**，即生产口径。
+            只给压测用：解码成本由分辨率主导，这是不改口径就能验证的「上限杠杆」——
+            用来量化「最高画质 vs 低档」差多少路。越界自动回退 0。
+        :param frame_interval: 抽帧间隔（秒）。**5 = 生产口径**（2026-10-14 起，
+            此前是 10）。只影响帧数量与磁盘，不影响带宽/CPU（见类 docstring）。
+        :param merged: 音视频是否合并到**一个** ffmpeg（默认 True）。合并省一半带宽
+            （一条流只读一遍）、一半 RSS、一半进程数，代价是两模态故障域耦合。
+            仅在同时要音频与抽帧时生效；只要一路时自动退化。要 A/B 对比时传 False。
         :param max_seconds: **防僵尸安全上限**（`-t`），不是主停止手段；None 表示不加
+        :param stream_proxy: ffmpeg 拉流用的代理 URL。**默认 None = 跟随环境变量**
+            `DOUYIN_STREAM_PROXY`（不设就是直连 = 生产口径，与改动前逐字节等价）；
+            传空串 `''` 可强制直连。与控制面的 `DOUYIN_PROXY` **刻意分开**——
+            444 打在控制面端点，FLV CDN 是另一套域名，不该被顺带塞进隧道
+            （一路 6.2 Mbps，5 路 ≈ 31 Mbps，走隧道既计费又可能撞带宽上限）。
         """
         self.live_id = live_id
         self.out_dir = str(out_dir)
         self.fetcher = fetcher
+        self.url_index = url_index
         self.want_audio = want_audio
         self.want_frames = want_frames
         self.audio_segment = audio_segment
         self.frame_interval = frame_interval
+        # 只有两个模态都要时才谈得上合并（任一为 False 就没有第二个输出可合）
+        self.merged = bool(merged) and want_audio and want_frames
         self.max_seconds = max_seconds
+        # None 表示「跟随 DOUYIN_STREAM_PROXY」，空串表示「强制直连」——用 is None 区分
+        self.stream_proxy = stream_proxy_url() if stream_proxy is None else (stream_proxy or None)
         self.log = log
         self.audio_dir = os.path.join(self.out_dir, 'audio')
         self.frames_dir = os.path.join(self.out_dir, 'frames')
@@ -268,6 +556,7 @@ class MediaCapture:
         # 几小时跑下来不排空会写满管道缓冲把 ffmpeg 卡死。
         self.audio_log = os.path.join(self.audio_dir, 'ffmpeg.log')
         self.frame_log = os.path.join(self.frames_dir, 'ffmpeg.log')
+        self.merged_log = os.path.join(self.out_dir, 'ffmpeg_media.log')
         self.stream_url = None
         self.audio_proc = None
         self.frame_proc = None
@@ -279,40 +568,110 @@ class MediaCapture:
     # ---------------- 流地址 ----------------
 
     def _resolve_stream_url(self):
-        """取当前可用流地址；**不需要浏览器**（见 extract_stream_urls_from_html）"""
+        """取当前可用流地址；**不需要浏览器**（见 extract_stream_urls_from_html）
+
+        两条来源，页面优先、enter 兜底：
+          1. 直播页 HTML —— 原路径，正常情况下够用
+          2. enter 接口 —— 页面端点被下发**验证码中间页**时（HTTP 200 但无 flv_pull_url，
+             IP 级、可长时间持续，实测会让音视频采集整体归零），退回这条
+        两条来源的 flv_pull_url 结构与画质顺序一致，所以 url_index 语义不变。
+        """
         if self.fetcher is None:
             self.log('[media] 未提供 fetcher，无法解析流地址')
             return None
-        html = self.fetcher.fetch_live_html()
-        if not html:
+        urls = extract_stream_urls_from_html(self.fetcher.fetch_live_html() or '')
+        if not urls:
+            # 页面拿不到（最常见原因：验证码中间页）→ 退到 enter 接口
+            try:
+                data = self.fetcher._enter_api('')
+            except Exception as e:
+                data = None
+                self.log("ERROR", "[media] enter 接口回退失败: %s" % e)
+            urls = extract_stream_urls_from_enter(data)
+            if urls:
+                self.log('[media] 页面未取到流地址（疑验证码中间页），已用 enter 接口回退')
+        if not urls:
             return None
-        urls = extract_stream_urls_from_html(html)
-        return urls[0] if urls else None
+        # url_index 越界（如某房间只有 1 档）回退 0，不因压测参数把生产路径弄挂
+        return urls[self.url_index] if self.url_index < len(urls) else urls[0]
 
     # ---------------- 命令构造 ----------------
 
     def _time_cap(self):
-        """`-t` 参数（防僵尸上限）。注意**不是**主停止手段，主停止是 stop_media()"""
+        """`-t` 参数（防僵尸上限）。注意**不是**主停止手段，主停止是 stop_media()
+
+        ⚠️ 调用方必须把它放在 `-i` **之前**。放在 `-i` 之后它是**输出选项**，只作用于
+        紧接着的那个输出 —— 合并模式（一条命令两个输出）下第二个输出就完全没有上限了
+        （实测踩过：探针里视频输出不受 `-t` 约束，靠发 `q` 才停）。
+        """
         return ["-t", str(int(self.max_seconds))] if self.max_seconds else []
+
+    def _proxy_args(self):
+        """ffmpeg 的 `-http_proxy` 参数（**默认空**，即生产口径直连）
+
+        ⚠️ 与 `-t` / `-skip_frame` 一样是**输入前置选项**，必须放在 `-i` **之前**。
+        放在 `-i` 之后会变成输出选项，对已建好的连接无效（`_time_cap` 踩过同款坑）。
+        """
+        return ["-http_proxy", self.stream_proxy] if self.stream_proxy else []
+
+    def _audio_args(self, start_number=0):
+        """音频输出段（选项 + 输出路径），供单路与合并两种命令共用。不含 `-map`"""
+        return ["-vn", "-ac", "1", "-ar", "16000", "-acodec", "pcm_s16le",
+                "-f", "segment", "-segment_time", str(self.audio_segment),
+                "-segment_start_number", str(start_number),
+                "-reset_timestamps", "1",
+                os.path.join(self.audio_dir, "segment_%03d.wav")]
+
+    def _frame_args(self, start_number=0):
+        """抽帧输出段（选项 + 输出路径），供单路与合并两种命令共用。不含 `-map`
+
+        `-vf fps=1/interval`：ffmpeg 直解 FLV 抽帧，**原始分辨率、无 scale**（口径勿改）。
+        """
+        return ["-vf", f"fps={1.0 / self.frame_interval}", "-q:v", "2",
+                "-start_number", str(start_number),
+                os.path.join(self.frames_dir, "frame_%04d.jpg")]
 
     def _audio_cmd(self, url, start_number=0):
         # **刻意不加 `-nostdin`**：停采时要往 stdin 写 `q` 让 ffmpeg 优雅退出并给
         # 当前分段收尾（见 stop_media）。子进程的 stdin 是 PIPE，不会抢终端输入。
-        return (["ffmpeg", "-y", "-loglevel", "error", "-i", url]
-                + self._time_cap()
-                + ["-vn", "-ac", "1", "-ar", "16000", "-acodec", "pcm_s16le",
-                   "-f", "segment", "-segment_time", str(self.audio_segment),
-                   "-segment_start_number", str(start_number),
-                   "-reset_timestamps", "1",
-                   os.path.join(self.audio_dir, "segment_%03d.wav")])
+        return (["ffmpeg", "-y", "-loglevel", "error"] + self._time_cap()
+                + self._proxy_args() + ["-i", url] + self._audio_args(start_number))
 
     def _frame_cmd(self, url, start_number=0):
-        # `-vf fps=1/interval`：ffmpeg 直解 FLV 抽帧，原始分辨率
-        return (["ffmpeg", "-y", "-loglevel", "error", "-i", url]
-                + self._time_cap()
-                + ["-vf", f"fps={1.0 / self.frame_interval}", "-q:v", "2",
-                   "-start_number", str(start_number),
-                   os.path.join(self.frames_dir, "frame_%04d.jpg")])
+        return (["ffmpeg", "-y", "-loglevel", "error"] + self._time_cap()
+                + self._proxy_args() + ["-skip_frame", "nokey", "-i", url]
+                + self._frame_args(start_number))
+
+    def _merged_cmd(self, url, audio_n=0, frame_n=0):
+        """合并单进程：**一条 input、两组 `-map` 输出**（音频 WAV 切片 + 原始分辨率抽帧）
+
+        为什么要合并（2026-10-14 实测）：`-vn` **不省带宽** —— 音频进程仍要读完整条
+        复用 FLV，实测音频档与视频档带宽完全相同（各 6.2 Mbps）。所以拆两个进程 =
+        **把同一条流读两遍**，一路占 `2 × 流码率`。合并成一条 input 后只读一遍，
+        带宽 ÷2、进程数 ÷2、RSS ÷2（实测 0.791 MB/s 出齐音频+帧，与单跑视频档同带宽）。
+
+        代价：两个模态**故障域耦合** —— 任一输出报错会整个进程退出、两路同时断。
+        `_watchdog` 会续采，所以只是中断粒度变粗，不会丢数据。要拆回两进程用
+        `merged=False`。
+
+        `-skip_frame nokey`（只解关键帧）是另一个杠杆：视频 CPU `0.161 → 0.013` 核、
+        RSS `209 → 116 MB`，**产出帧数不变**（`fps` 滤镜本来只写解码完的 I 帧，跳掉的
+        B/P 帧从来也不写）。可用性取决于关键帧间隔 —— 实测抖音这条流 **GOP = 2.0s**，
+        密于 5s 的抽帧间隔，所以是「挑帧」而非「补帧」，不会写出重复 JPG。
+        ⚠️ 副作用：帧内容对齐到关键帧（2s 整数倍），5s 网格上的画面最多偏 ±1s。
+        """
+        cmd = ["ffmpeg", "-y", "-loglevel", "error"] + self._time_cap()
+        if self.want_frames:
+            cmd += ["-skip_frame", "nokey"]
+        cmd += self._proxy_args()
+        cmd += ["-i", url]
+        # `-map` 在合并模式下**必须有**：不给的话每个输出各自做默认选流，抽帧输出会把
+        # 音频流也选进去，而 jpg muxer 装不下音频（`-vf` 对音频无效）→ 直接报错退出。
+        if self.want_audio:
+            cmd += ["-map", "0:a"] + self._audio_args(audio_n)
+        if self.want_frames:
+            cmd += ["-map", "0:v"] + self._frame_args(frame_n)
+        return cmd
 
     @staticmethod
     def _count_files(pattern):
@@ -326,6 +685,23 @@ class MediaCapture:
         ⚠️ 序号必须**续接**已有的产物：`segment_%03d.wav` / `frame_%04d.jpg` 若从 0
         重开，配合 `-y` 会**覆盖**上一段的产物。首次为 0，续采时按已落盘文件数接着排。
         """
+        # ⚠️ 已收到停止信号就**绝不再起进程**。watchdog 的续采路径会调到这里，而
+        # `stop_media()` 无法中断正在 `_resolve_stream_url()`（网络调用）里的 watchdog
+        # —— 它 join 超时返回后，watchdog 仍会走到这里起一对**没人收**的 ffmpeg，
+        # 孤儿进程会一直占着一条流的带宽。实测 N=20 档漏了 4 个。
+        if self._stop_event.is_set():
+            return
+        if self.merged:
+            # 合并模式：**一个进程**同时喂两个字段，判一个就够（两者恒为同一对象）
+            if self.audio_proc is None:
+                an = self._count_files(os.path.join(self.audio_dir, "segment_*.wav"))
+                fn = self._count_files(os.path.join(self.frames_dir, "frame_*.jpg"))
+                p = subprocess.Popen(
+                    self._merged_cmd(self.stream_url, an, fn),
+                    stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                    stderr=open(self.merged_log, 'ab'))
+                self.audio_proc = self.frame_proc = p
+            return
         if self.want_audio and self.audio_proc is None:
             n = self._count_files(os.path.join(self.audio_dir, "segment_*.wav"))
             self.audio_proc = subprocess.Popen(
@@ -354,6 +730,7 @@ class MediaCapture:
         self._watchdog_thread = threading.Thread(target=self._watchdog, daemon=True)
         self._watchdog_thread.start()
         self.log(f'[media] 已启动音视频采集（音频={self.want_audio} 抽帧={self.want_frames} '
+                 f'{"合并单进程" if self.merged else "音视双进程"} '
                  f'间隔={self.frame_interval}s 段长={self.audio_segment}s）')
         return True
 
@@ -387,17 +764,51 @@ class MediaCapture:
                 except Exception:
                     pass
 
+    def _kill_procs(self):
+        """优雅停掉当前所有 ffmpeg 并清空引用（去重）
+
+        ⚠️ **合并模式下 `audio_proc` 与 `frame_proc` 是同一个对象**，必须按对象去重，
+        否则会对同一进程走两遍停流程（第二遍因 `poll()` 非空而空转 —— 虽无害，但语义
+        混乱，且掩盖「其实只有一个进程」这个事实）。这里是唯一的收停入口。
+        """
+        procs = []
+        for p in (self.audio_proc, self.frame_proc):
+            if p is not None and all(p is not q for q in procs):
+                procs.append(p)
+        for p in procs:
+            self._graceful_stop(p)
+        self.audio_proc = self.frame_proc = None
+
+    # 小于这个字节数的产物一律当**残片**删掉。
+    #
+    # 为什么不是「> 0 字节」就留下（原判据）：ffmpeg 给一个**已经下播的房间**拉流时，
+    # 会成功地写出**一个完整合法的文件头、但一个采样点都没有**就退出 —— 实测
+    # 2026-10-15 的产物是 **78 字节**（`RIFF....WAVEfmt ` + `LIST/ISFT` + 长度 0 的
+    # `data` 块），ffprobe 连时长都读不出来。旧判据只删「0 字节」，于是这个空壳被
+    # 当成**一段有效音频**：日志里那些「0 帧 / 1 段音频」的场次就是这么来的，
+    # 而且它会被写进 `stop_media()` 的返回值、进下游统计、进研究语料。
+    #
+    # 门槛取 1 KiB：78 字节的文件头远在下面；而 16kHz 单声道下 1 KiB ≈ 32 毫秒，
+    # 正常封口的**最后一段**最短也有几十毫秒（实测一次 7.66s 的正常收尾），
+    # 不会被误删。
+    MEDIA_MIN_VALID_BYTES = 1024
+
     @staticmethod
     def _prune_empty(*patterns):
-        """删掉 0 字节残片（硬杀留下的空壳），返回存活文件（大小 > 0）"""
+        """删掉残片（0 字节硬杀空壳，或小到不可能含内容的），返回存活文件"""
         alive = []
         for pattern in patterns:
             for p in glob.glob(pattern):
-                if os.path.getsize(p) > 0:
+                try:
+                    size = os.path.getsize(p)
+                except OSError:
+                    continue
+                if size >= MediaCapture.MEDIA_MIN_VALID_BYTES:
                     alive.append(p)
                 else:
                     try:
-                        os.remove(p)      # 空壳是纯噪声，留着会污染数据集与校验
+                        # 残片是纯噪声：留着会污染数据集、校验脚本与统计口径
+                        os.remove(p)
                     except OSError:
                         pass
         return sorted(alive)
@@ -408,11 +819,14 @@ class MediaCapture:
         :return: {"audio": [路径...], "frames": [路径...], "restarts": int, "ok": bool}
         """
         self._stop_event.set()
-        self._graceful_stop(self.audio_proc)
-        self._graceful_stop(self.frame_proc)
-        self.audio_proc = self.frame_proc = None
+        self._kill_procs()
         if self._watchdog_thread is not None and self._watchdog_thread.is_alive():
             self._watchdog_thread.join(timeout=2)
+        # ⚠️ 兜底再扫一遍：上面 join 只等 2s，而 watchdog 可能正卡在
+        # `_resolve_stream_url()` 的网络请求里（拥塞时数秒）→ join 超时返回，
+        # 但它随后还会 _spawn()。`_spawn()` 自身已有停止守卫、watchdog 尾部也有
+        # 自收，这里再扫一次是为了**不让任何一条路径漏掉**孤儿 ffmpeg。
+        self._kill_procs()
         audio = self._prune_empty(os.path.join(self.audio_dir, "segment_*.wav"))
         frames = self._prune_empty(os.path.join(self.frames_dir, "frame_*.jpg"))
         return {'audio': audio, 'frames': frames, 'restarts': self.restarts,
@@ -448,13 +862,40 @@ class MediaCapture:
                 continue
             self.stream_url = url
             self.restarts += 1
-            self.log(f'[media] ffmpeg 提前退出（音频={dead_audio} 抽帧={dead_frame}），'
+            what = '合并进程' if self.merged else f'音频={dead_audio} 抽帧={dead_frame}'
+            self.log(f'[media] ffmpeg 提前退出（{what}），'
                      f'用新流地址续采（第 {self.restarts} 次）')
             if dead_audio:
                 self.audio_proc = None
             if dead_frame:
                 self.frame_proc = None
             self._spawn()
+            # 收尾竞态：停止信号可能在 `_spawn()` **之后**才置位（上面的守卫是在
+            # `_resolve_stream_url()` 之后判的，而停止也可能恰好挤在这中间）。此时
+            # `stop_media` 已经扫过一遍了，只认这一对刚起的进程自己收掉。
+            if self._stop_event.is_set():
+                self._kill_procs()
+                return
+
+
+# ── ttwid 进程级缓存 ────────────────────────────────────────────────────────
+# ttwid 是**访客级**标识（`live.douyin.com` 首页响应的 Set-Cookie），与直播间无关，
+# 全进程同一个值。原实现每个 `DouyinLiveWebFetcher` 都重新请求一次首页 ——
+# 实测 0.87s/路，100 路就是 87s 的纯重复开销，且每次都重新做 DNS+TCP+TLS 握手。
+# 这里改为进程级共享：谁先要谁去取，其余复用。
+#
+# 锁是**持着做网络请求**的，所以首次获取失败时会最多阻塞其他线程一个 timeout（30s）。
+# 这是刻意的取舍：ttwid 拿不到的话整个采集链路本来也走不通，让它显式串行等待
+# 好过 142 个线程各自去撞一遍首页（那才是真的把风控招来）。
+#
+# ★ TTL 是给**长跑守护进程**准备的：`auto_crawl` 一跑几周不重启，如果只缓存不刷新，
+#   一旦 ttwid 失效（Cookie 过期 / 风控降级），整个进程后续新建的连接都会**静默**带
+#   上一个死值 —— 而每个 fetcher 各自的 `__ttwid` 又会把它固化下来，连重试都没有。
+#   压测那种短进程无所谓，守护进程必须有刷新路径。
+_TTWID_LOCK = threading.Lock()
+_TTWID_CACHE = None
+_TTWID_CACHE_TS = 0.0    # 上次成功获取的时刻（TTL 判定用）
+_TTWID_TTL = 30 * 60     # 秒。到点强制重取一次 —— 30 分钟 = 48 次/天的首页请求，可忽略
 
 
 class DouyinLiveWebFetcher:
@@ -496,6 +937,27 @@ class DouyinLiveWebFetcher:
         self.ws_push_host = "webcast100-ws-web-lq.douyin.com"
         self.ws_cursor = "d-1_u-1_fh-7392091211001140287_t-1721106114633_r-1"
         self.ws_internal_ext = None  # None = 按 room_id 现算默认值（见 _default_internal_ext）
+        # ★ 最后一帧的到达时刻（见 frame_age）。构造时就置位，否则「还没收到第一帧」
+        #   会被算成「已经很久没收到帧」，刚连上就被判僵死。
+        self.last_frame_ts = time.time()
+        # WS 断线重连状态（见 start / _prepare_reconnect / next_reconnect_state）
+        self._intentional_stop = False      # stop() 置位 = 「下播/SIGTERM/外部停」，与「被掐」区分
+        self._reconnect_wake = threading.Event()  # 让重连退避等待可被 stop() 打断
+        self.reconnect_count = 0            # 本会话的重连**次数**（写进 session_meta）
+        self.reconnect_gap_s = 0.0          # 主动退避等待的累计秒数（**不是**丢数据时长）
+
+    def frame_age(self):
+        """距**最后一帧**过了多少秒 —— WS 僵死判据（见 auto_crawl._one_cycle）。
+
+        ⚠️ 判据必须用「距最后一帧」而**不是**「距最后一条弹幕」：心跳的 `need_ack`
+        也走 `_wsOnMessage`，健康连接每 ~5 秒就刷新一次，而一个安静的小房间可能
+        几分钟没有弹幕。用弹幕会把安静房间误判成僵死。
+
+        失效模式：TCP 连接活着，但抖音不再下发任何数据。此时 `on_offline` 永远不来
+        （它是 `ControlMessage status==3` 触发的），`ws_thread.is_alive()` 恒为真 ——
+        2026-10-15 实测有房间这样挂死 90 分钟，且**该主播之后每次开播全部漏采**。
+        """
+        return time.time() - self.last_frame_ts
 
     def log(self, log_type, message):
         """记录日志"""
@@ -512,16 +974,88 @@ class DouyinLiveWebFetcher:
             except Exception:
                 pass
 
-    def start(self):
-        self.running = True
-        self._connectWebSocket()
+    def start(self, max_reconnects=0, reconnect_wait=RECONNECT_WAIT):
+        """连上并开始接收；**断线自动重连**，直到本场真正结束才返回。
+
+        对外保持「`start()` 返回 == 本场结束」的语义（见 `next_reconnect_state` 上面那段），
+        所以调用方拿 `ws_thread.is_alive()` 当「本场还在采吗」的判据**继续成立** ——
+        `auto_crawl._one_cycle` 的等待循环与 `_wait_media_slot` 都因此一行不用改。
+
+        `max_reconnects` 默认 **0 = 不重连**（改动前行为）。只有 `auto_crawl` 显式打开。
+        """
+        # 每次 start 都是一次新的采集会话：GUI 会**复用同一个 fetcher 实例**
+        # （`stop_monitor` 之后再 `start_monitor`），不复位的话残留的
+        # `_intentional_stop=True` 会让第一次连接返回后立刻 break。
+        self._intentional_stop = False
+        self.reconnect_count = 0
+        self.reconnect_gap_s = 0.0
+        fails = 0
+        while True:
+            # ★★ 每次连接前都要置位：`_wsOnOpen` 自己不置位（只起心跳线程），而
+            #    `_teardown_ws` 会把它置 False —— 漏了这行，重连后握手成功但**心跳永不发出**，
+            #    连接会被服务端当僵尸掐掉。
+            self.running = True
+            t0 = time.time()
+            self._connectWebSocket()        # 阻塞到这条连接关闭
+            if self._intentional_stop:
+                break                       # 下播 / SIGTERM / 外部 stop()
+            keep, fails = next_reconnect_state(time.time() - t0, fails, max_reconnects)
+            if not keep:
+                if max_reconnects > 0:      # 0 = 「配置成不重连」，不是「额度用尽」
+                    self.log("WEBSOCKET",
+                             f"重连额度用尽（连续 {fails} 次连接都没活过 "
+                             f"{RECONNECT_GRACE:.0f} 秒）—— 结束本场")
+                break
+            self.reconnect_count += 1
+            self.log("WEBSOCKET", f"⚠️ 连接断开，第 {self.reconnect_count} 次重连…")
+            t_gap = time.time()
+            if not self._prepare_reconnect(reconnect_wait):
+                break                       # 退避等待期间被 stop() 叫醒
+            self.reconnect_gap_s += time.time() - t_gap
+
+    def _teardown_ws(self, join_timeout=1.0, clear_ws=False):
+        """收掉当前这条连接：停心跳线程、关 socket。
+
+        三个调用方共用（`stop()` / `_connectWebSocket` 的握手异常 / `_prepare_reconnect`），
+        且默认路径必须与改动前**逐字节等价** —— 所以这里就是原 `stop()` 的那三行。
+
+        `clear_ws=True`（重连用）**先**把 `self.ws` 摘成 None：`_sendHeartbeat` 的循环体
+        读的是实例属性 `self.ws`，重连后它已指向**新** socket，旧心跳线程醒来会往新连接
+        发 ping 且永不退出。摘成 None 让它下一轮必定 `break`。
+
+        `join_timeout` 必须 > `_sendHeartbeat` 的 `time.sleep(5)`，否则 join 恒定超时、
+        等于没 join（`stop()` 用 1.0 是历史值，心跳最长睡 5 秒时它本来也会超时返回，
+        但那时进程正要退出、留着无所谓；重连是**长期**循环，漏 join 会累积线程）。
+        """
+        self.running = False
+        ws = self.ws
+        if clear_ws:
+            self.ws = None
+        if ws:
+            try:
+                ws.close()
+            except Exception:
+                pass
+        hb = self.heartbeat_thread
+        if hb is not None and hb.is_alive() and hb is not threading.current_thread():
+            hb.join(timeout=join_timeout)
+        self.heartbeat_thread = None
 
     def stop(self):
-        self.running = False
-        if self.ws:
-            self.ws.close()
-        if self.heartbeat_thread and self.heartbeat_thread.is_alive():
-            self.heartbeat_thread.join(timeout=1.0)
+        self._intentional_stop = True   # 「下播 / SIGTERM / 外部停」—— 与「被掐」区分开
+        self._reconnect_wake.set()      # 打断重连退避等待，否则 systemctl stop 要白等
+                                        # 最多 max_reconnects × reconnect_wait 秒
+        self._teardown_ws()             # join_timeout=1.0，与改动前完全一致
+
+    def _prepare_reconnect(self, wait):
+        """重连前清干净上一轮的残留；返回 False 表示等待期间被 `stop()` 叫醒（别再连了）"""
+        self._teardown_ws(join_timeout=HEARTBEAT_JOIN_TIMEOUT, clear_ws=True)
+        # ★★ 必须重置：`frame_age()` 用的是它，而 `auto_crawl._stalled` 拿
+        #    `frame_age() > 300` 判僵死。不重置的话重连成功的第一秒 frame_age 就等于
+        #    「上一帧到现在」，**新连接刚建立就被判僵死**，重连等于白做。
+        self.last_frame_ts = time.time()
+        self._reconnect_wake.clear()
+        return not self._reconnect_wake.wait(wait)
 
     @property
     def ttwid(self):
@@ -531,15 +1065,29 @@ class DouyinLiveWebFetcher:
         """
         if self.__ttwid:
             return self.__ttwid
-        headers = dict(COMMON_HEADERS)
-        try:
-            # 加 timeout：同 room_id property 那条，原实现无超时，挂死的连接会永久占住调用线程
-            response = requests.get(self.live_url, headers=headers, timeout=30)
-            response.raise_for_status()
-        except Exception as err:
-            self.log("ERROR", f"请求直播URL错误: {err}")
-        else:
-            self.__ttwid = response.cookies.get('ttwid')
+        # 进程级共享（见模块顶部 _TTWID_CACHE 的说明）：96 路 concurrent 下
+        # 原实现会并发打 96 次首页，现在只打一次。带 TTL，见 _TTWID_TTL。
+        global _TTWID_CACHE, _TTWID_CACHE_TS
+        with _TTWID_LOCK:
+            now = time.time()
+            if _TTWID_CACHE is None or (now - _TTWID_CACHE_TS) > _TTWID_TTL:
+                headers = dict(COMMON_HEADERS)
+                try:
+                    # 加 timeout：同 room_id property 那条，原实现无超时，挂死的连接会永久占住调用线程
+                    response = requests.get(self.live_url, headers=headers, timeout=30,
+                                            proxies=proxy_for_requests())
+                    response.raise_for_status()
+                except Exception as err:
+                    self.log("ERROR", f"请求直播URL错误: {err_text(err)}")
+                    # 取不到时**先降级复用旧值**（刚过期但多半还能用），好过整条链路立刻断；
+                    # 旧值也没有才返回 None —— 不把失败固化进缓存，下次调用仍会重试
+                    if _TTWID_CACHE is not None:
+                        self.__ttwid = _TTWID_CACHE
+                        return self.__ttwid
+                    return None
+                _TTWID_CACHE = response.cookies.get('ttwid')
+                _TTWID_CACHE_TS = now
+            self.__ttwid = _TTWID_CACHE
             return self.__ttwid
 
     def fetch_live_html(self):
@@ -561,13 +1109,65 @@ class DouyinLiveWebFetcher:
                    "cookie": f"ttwid={self.ttwid}&msToken={generateMsToken()}; __ac_nonce=0123407cc00a9e438deb4"}
         try:
             # 加 timeout：原实现没有超时，100 并发下一条挂死的请求会永久占住一个线程
-            response = requests.get(url, headers=headers, timeout=30)
+            response = requests.get(url, headers=headers, timeout=30,
+                                    proxies=proxy_for_requests())
             response.raise_for_status()
         except Exception as err:
-            self.log("ERROR", f"请求直播间URL错误: {err}")
+            self.log("ERROR", f"请求直播间URL错误: {err_text(err)}")
             return None
         self.live_page_html = response.text
         return self.live_page_html
+
+    def _enter_api(self, room_id_str=''):
+        """GET `/webcast/room/web/enter/`，返回响应里的 `data` 字典；失败返回 None。
+
+        抽成独立方法的原因：`room_id` 与 `get_room_status` 都要打这条接口，而**两者
+        都不需要事先知道真实 room_id** —— 实测 `room_id_str` 传空串照样返回完整数据，
+        `data.data[0].id_str` 就是真 room_id（与 HTML 正则抠出来的一致，4/4 房间验证）。
+
+        原实现是反过来的：`get_room_status` 为了填 `room_id_str` 先去调 `self.room_id`，
+        而那会下载**整个 1.1MB 直播页 HTML** 再正则抠一个 id —— 等于每次状态请求
+        都白下一次整页。实测 JSON 接口 0.51-0.74s vs HTML 1.07-1.29s。
+        """
+        ms_token = generateMsToken()
+        params = {
+            'aid': '6383',
+            'app_name': 'douyin_web',
+            'live_id': '1',
+            'device_platform': 'web',
+            'language': 'zh-CN',
+            'enter_from': 'web_live',
+            'cookie_enabled': 'true',
+            'screen_width': '1536',
+            'screen_height': '864',
+            'browser_language': 'zh-CN',
+            'browser_platform': 'Win32',
+            'browser_name': 'Edge',
+            'browser_version': '133.0.0.0',
+            'web_rid': self.live_id,
+            'room_id_str': room_id_str,
+            'enter_source': '',
+            'is_need_double_stream': 'false',
+            'insert_task_id': '',
+            'live_reason': '',
+            'msToken': ms_token,
+        }
+        query_str = '&'.join(f"{k}={urllib.parse.quote(str(v))}" for k, v in params.items())
+        a_bogus = generate_a_bogus(query_str, self.user_agent)
+        params['a_bogus'] = a_bogus
+
+        url = 'https://live.douyin.com/webcast/room/web/enter/'
+        try:
+            resp = requests.get(url, params=params, headers={
+                **COMMON_HEADERS,
+                'Cookie': f'ttwid={self.ttwid}; msToken={ms_token}; __ac_nonce=0123407cc00a9e438deb4',
+                'Referer': f'https://live.douyin.com/{self.live_id}',
+            }, timeout=30, proxies=proxy_for_requests())
+            resp.raise_for_status()
+            return resp.json().get('data')
+        except Exception as e:
+            self.log("ERROR", f"请求直播间状态失败: {err_text(e)}")
+            return None
 
     @property
     def room_id(self):
@@ -577,6 +1177,15 @@ class DouyinLiveWebFetcher:
         """
         if self.__room_id:
             return self.__room_id
+        # 快路径：轻量 JSON 接口（实测 0.5-0.7s）。房间对象在 data.data[0]，
+        # 注意不是 data.room —— 后者实测恒为空字典。
+        data = self._enter_api('')
+        if data:
+            rooms = data.get('data') or []
+            if rooms and rooms[0].get('id_str'):
+                self.__room_id = str(rooms[0]['id_str'])
+                return self.__room_id
+        # 兜底：走原来的 HTML 正则。接口改版/字段改名时不至于整条链路断掉。
         html = self.fetch_live_html()
         if not html:
             return None
@@ -626,46 +1235,20 @@ class DouyinLiveWebFetcher:
         room_status: 2 直播已结束
         room_status: 0 直播进行中
         """
-        ms_token = generateMsToken()
-        params = {
-            'aid': '6383',
-            'app_name': 'douyin_web',
-            'live_id': '1',
-            'device_platform': 'web',
-            'language': 'zh-CN',
-            'enter_from': 'web_live',
-            'cookie_enabled': 'true',
-            'screen_width': '1536',
-            'screen_height': '864',
-            'browser_language': 'zh-CN',
-            'browser_platform': 'Win32',
-            'browser_name': 'Edge',
-            'browser_version': '133.0.0.0',
-            'web_rid': self.live_id,
-            'room_id_str': self.room_id,
-            'enter_source': '',
-            'is_need_double_stream': 'false',
-            'insert_task_id': '',
-            'live_reason': '',
-            'msToken': ms_token,
-        }
-        query_str = '&'.join(f"{k}={urllib.parse.quote(str(v))}" for k, v in params.items())
-        a_bogus = generate_a_bogus(query_str, self.user_agent)
-        params['a_bogus'] = a_bogus
-
-        url = 'https://live.douyin.com/webcast/room/web/enter/'
+        # 复用 _enter_api。**不再传 self.room_id** —— 原实现为它先去下载 1.1MB 的
+        # 直播页 HTML，而实测 room_id_str 传空串照样返回完整数据（见 _enter_api 注释）。
+        data = self._enter_api(self.__room_id or '')
         try:
-            resp = requests.get(url, params=params, headers={
-                **COMMON_HEADERS,
-                'Cookie': f'ttwid={self.ttwid}; msToken={ms_token}; __ac_nonce=0123407cc00a9e438deb4',
-                'Referer': f'https://live.douyin.com/{self.live_id}',
-            }, timeout=30)
-            resp.raise_for_status()
-            data = resp.json().get('data')
             if data:
                 room_status = data.get('room_status')
                 user = data.get('user') or {}
-                room = data.get('room') or {}
+                # 房间对象在 data.data[0]。data.room 实测**恒为空字典** —— 原实现读的
+                # 就是它，所以 room_title / user_count_str / room_stats 一直是空的。
+                rooms = data.get('data') or []
+                room = rooms[0] if rooms else {}
+                # 顺手缓存真 room_id，供 get_audience_ranklist 等后续调用复用
+                if room.get('id_str') and not self.__room_id:
+                    self.__room_id = str(room['id_str'])
                 user_id = user.get('id_str') or str(user.get('id') or '')
                 nickname = user.get('nickname') or ''
                 status = '正在直播' if room_status == 0 else '已结束'
@@ -699,7 +1282,7 @@ class DouyinLiveWebFetcher:
                 self.log("ERROR", "获取直播间状态失败，返回数据为空")
                 return False, "未知", "未知", "未知"
         except Exception as e:
-            self.log("ERROR", f"获取直播间状态时出错: {str(e)}")
+            self.log("ERROR", f"获取直播间状态时出错: {err_text(e)}")
             return False, "错误", "未知", "未知"
 
     def get_audience_ranklist(self, anchor_id):
@@ -734,6 +1317,7 @@ class DouyinLiveWebFetcher:
                 params=params,
                 headers=headers,
                 timeout=30,
+                proxies=proxy_for_requests(),
             )
             response.raise_for_status()
             data = json.loads(response.text)
@@ -869,10 +1453,15 @@ class DouyinLiveWebFetcher:
                                              on_message=self._wsOnMessage,
                                              on_error=self._wsOnError,
                                              on_close=self._wsOnClose)
-            self.ws.run_forever()
+            # 代理走 `run_forever` 的参数（WebSocketApp 构造不吃这些）：
+            # websocket-client 不认 http_proxy 环境变量，必须显式传。未配置时代入 {}，
+            # 与改动前的 `run_forever()` 逐字节等价。
+            self.ws.run_forever(**proxy_for_ws())
         except Exception as e:
             self.log("ERROR", f"WebSocket连接错误: {str(e)}")
-            self.stop()
+            # 清理动作与原来的 `self.stop()` 逐字节相同，但**不标记** `_intentional_stop`
+            # —— 否则「握手就失败」会被当成「主动停止」而**不重连**，重连额度形同虚设。
+            self._teardown_ws()
 
     def _sendHeartbeat(self):
         """
@@ -935,6 +1524,11 @@ class DouyinLiveWebFetcher:
         package = PushFrame().parse(message)
         response = Response().parse(self._decodeFramePayload(package))
 
+        # ★ 这里**是所有下行帧的唯一必经之路**（心跳的 need_ack 也走这里），所以是
+        #   「连接还活着吗」最可靠的观测点。放在 parse 之后：解析失败的帧不算有效帧。
+        #   用途见 frame_age() 与 auto_crawl 的僵死判据。
+        self.last_frame_ts = time.time()
+
         # 返回直播间服务器链接存活确认消息，便于持续获取数据。
         # 客户端回显的是**下行 PushFrame 头部 im-internal_ext 的原值**，不是 Response 内部的
         # internal_ext 字段（抓包实测两者 first_req_ms/seq 存在系统性差异，见 douyinLive
@@ -993,7 +1587,11 @@ class DouyinLiveWebFetcher:
 
     def _wsOnClose(self, ws, *args):
         self.log("WEBSOCKET", "WebSocket连接已关闭.")
-        self.running = False
+        # ★ 只认「当前这条连接」：重连后旧 socket 的延迟回调会把新连接的 `running`
+        #   清掉，于是新连上的心跳线程第一轮就退出。默认（不重连）路径下 `self.ws`
+        #   就是刚关的那条 → 条件恒真 → 与改动前行为一致。
+        if ws is self.ws:
+            self.running = False
 
     def _parseChatMsg(self, payload):
         """聊天消息"""

@@ -1,0 +1,20 @@
+[Unit]
+Description=Run Douyin Live COS archive every hour
+
+[Timer]
+# 开机 10 分钟后先跑一次：等网络与守护进程起来（crawl 是 OnBootSec=5min、体检 3 分钟）。
+OnBootSec=10min
+# 之后每小时一次。选 1 小时的理由：
+#   * 磁盘流入 ≈ 2.9 GB/小时（实测 68.6 GB/天），每小时归档一轮约 3 GB、内网约 1 分钟；
+#   * 这个 timer **不删**，所以周期只影响「数据进 COS 的速度」，**不影响磁盘水位** ——
+#     真要让磁盘降下来得靠笔记本那侧（见 douyin-archive.service 顶部）。
+# ⚠️ 不要调到低于 30 分钟：一轮实测 2 分钟，而 `cos_archive` 的 `--inflight-min 15` 会把
+#   「最近 15 分钟还在写」的场次当作**采集中**跳过 —— 跑太勤只是反复扫目录（判定
+#   「该传哪些场次」那一步是 O(场次数) 的），并不会让数据更早进 COS。
+OnUnitActiveSec=1h
+# 关机期间错过的轮次，开机后补跑一次。对本单元尤其重要：漏掉的轮次意味着那段时间采到的
+# 场次没人归档，补跑一轮能把积压补上（归档是幂等的，已传过的会按账本跳过）。
+Persistent=true
+
+[Install]
+WantedBy=timers.target

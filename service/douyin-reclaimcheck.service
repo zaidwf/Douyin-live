@@ -1,0 +1,33 @@
+[Unit]
+Description=Douyin Live 回收链路体检（one-shot：数据进 COS 了吗 / 磁盘在回收吗）
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Type=oneshot：跑完即退，**退出码就是判定**（0 健康 / 1 有告警）。
+# 于是 `systemctl --failed` 会直接列出它 —— 这就是告警面，本仓库没有、也**不打算造**
+# 邮件/钉钉通道（多一个通道就多一个没人看的东西）。判据见 reclaim_check.py 顶部。
+Type=oneshot
+# 必须 root：`config/cos.env` 是 `root:root 600`，非 root 读不到凭据 → 判据第三条
+# （核对 COS 上对象还在不在）恒报「拿不到凭据」，于是每 30 分钟一次假告警。
+User=root
+WorkingDirectory=/opt/douyin-live
+ExecStart=/opt/douyin-live/venv/bin/python /opt/douyin-live/service/reclaim_check.py
+
+# 不加 Restart=always / on-failure，理由同 douyin-healthcheck / douyin-ledger / douyin-archive：
+# 跑完即退的单元加 always 会死循环刷 journal；on-failure 会把失败重试成成功，
+# `systemctl --failed` 这个告警面就瞎了。
+#
+# 也**不要**加 EnvironmentFile：凭据是 `load_cos_env()` 读**文件**，不是读环境变量 ——
+# 加进来只会把 cos.env 的密钥灌进进程环境（同 douyin-archive.service 的说明）。
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=douyin-reclaimcheck
+
+# 一轮要 HEAD 一遍「服务器上还在、且账本说已归档」的场次（实测 39 场 ≈ 秒级）。
+# 磁盘长期不回收时这个集合会变大，给足余量但不无限等。
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target

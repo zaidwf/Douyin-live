@@ -1,0 +1,14 @@
+[Unit]
+Description=Run Douyin Live Crawl Health Check every 10 minutes
+
+[Timer]
+# 开机 3 分钟后先跑一次（等网络与守护进程起来，避免开机瞬间的假 down）
+OnBootSec=3min
+# 之后每 10 分钟一次。周期选择：守护进程一轮是 60s，30 分钟的「不新鲜」阈值
+# 意味着体检最多滞后一个周期 —— 而 10 分钟足够在演变成「空转了半宿」前发现。
+OnUnitActiveSec=10min
+# 关机期间错过的检查，开机后补跑一次（否则重启一次就丢掉一次告警机会）
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,121 @@
+# 服务器部署清单 —— ★ 这是「要传什么」的唯一真相，pack.sh 只认这个文件
+#
+# 一行一个 **repo 相对路径**（相对仓库根），`#` 起注释，空行忽略。
+# pack.sh 会逐条核对存在性：**少一个文件就报错退出**，不静默漏传
+# （漏传的典型后果：a_bogus 签名脚本没了 → enter 接口静默返回空体，
+#   现象是「连上了但一条数据都没有」，很难查）。
+#
+# ⚠️ 本文件列了源码路径，但**不复制**源码 —— 仓库里 liveMan.py 永远只有一份，
+#    改代码只改根目录那份，不会出现「service/ 里那份是旧的」。详见 README.md。
+
+# ── 采集核心（缺一不可）────────────────────────────────────────────
+auto_crawl.py
+liveMan.py
+data_recorder.py
+sign.js
+#    ↑ WS `signature` 签名脚本（492KB），generateSignature() 的默认路径。
+# ⚠️ 下一行在 .gitignore 里（`lib/`），**git push 传不过去**，必须靠本包带：
+lib/reverse/douyin_old_algo_ref.js
+#    ↑ HTTP `a_bogus` 签名脚本，generate_a_bogus() 的默认路径。
+#      缺了它 enter / ranklist 会 HTTP 200 但响应体为空（静默反爬），排查很费劲。
+protobuf/__init__.py
+protobuf/douyin.py
+requirements.txt
+
+# ── 名单 ──────────────────────────────────────────────────────────
+documents/huitun_10_100w_1015_final.xlsx
+#    ↑ **生产名单（157 人）**：守护进程与体检都用它，5 主播测试的候选池也是它。
+anchor.xlsx
+#    ↑ 守护进程的默认名单（不传 xlsx_path 时用它）。
+
+# ── 测试与校验（纯守护跑**不需要**，5 路测试要）────────────────────
+metrics.py
+#    ↑ 子进程/网络/磁盘采样。5 路测试要靠它量 ffmpeg 树的开销。
+test/validate_fullmodal.py
+#    ↑ 产物真实性校验（音频非静音 / 帧可解码 / 文本非空）。
+service/run_5anchors.py
+#    ↑ 5 主播并发全模态测试的编排器。
+
+# ── 定时体检（产出看门狗）─────────────────────────────────────────
+service/health_check.py
+#    ↑ 体检本体：探通道 + 查 data/ 新鲜度 → 退出码即判定（0 健康 / 1 down|stale）。
+#      依赖 liveMan.py / auto_crawl.py（上面已列）与那份名单，**不是**独立脚本。
+service/douyin-healthcheck.service
+service/douyin-healthcheck.timer
+#    ↑ 每 10 分钟跑一次体检。缺了这个，「隧道死了但进程还 active」没人会发现
+#      （2026-10-15 青果隧道事故就是这样空转了几个小时）。
+
+# ── 归档到 COS（服务器出口被带宽包卡死那条路的唯一解）──────────────
+service/cos_archive.py
+#    ↑ 把采完的场次**打包成 tar** 传到腾讯云 COS。走**内网**（实测 59.4 MB/s，
+#      公网出口只有 0.33 MB/s —— 差 178 倍），所以它是「服务器磁盘被持续回收」
+#      这件事唯一跑得通的通路。
+#      **零依赖**：COS V5 签名用 hashlib/hmac 手写（`cos_authorization()`），
+#      所以部署仍然只是拷文件，服务器上**不需要** pip install。别改成引 SDK。
+#      默认**不删**服务器那份，要删得显式 `--delete-after-upload`，且真删走
+#      `live_ledger.py --delete-list`（继承墓碑与两道硬保护）。
+#      凭据在服务器上另建 `config/cos.env`（root:root 600），**不进包**。
+service/douyin-archive.service
+service/douyin-archive.timer
+#    ↑ 每小时归档一轮（2026-10-16 加，用户选「方案 A 双机分工」）。**只做链路第 ① 步**：
+#      `cos_archive` 默认**不删**服务器那份，删除必须由笔记本发起（三道门禁只在笔记本上，
+#      `pull_sessions.py` 里有 assert 禁止服务器自删）。所以这个 timer **不省磁盘** ——
+#      它保证的是「数据尽快进 COS」（笔记本关机的那段时间也不至于只躺在服务器上）。
+#      ⚠️ 别拿它的退出码当「数据已在 COS」的证据：0 只说明「跑完了」，HEAD 才是证据。
+
+# ── 回收链路体检（补上面那个 timer 的告警面）──────────────────────
+service/reclaim_check.py
+#    ↑ 三条判据：① 根盘可用空间（**笔记本那条腿**停了 → 磁盘只涨不落，它是两条腿的
+#      联合指标）② 归档心跳 `cos_archive.beat` 的年龄（timer **压根没跑** —— 这种停法
+#      永远不会让任何单元 failed，`systemctl --failed` 一片干净）③ 账本说已归档、
+#      COS 上对象**此刻还在不在**（★ 静默丢失：唯一的副本没了，而 `cos_archive` 自己的
+#      HEAD 复查排在 `if not todo: return` 之后，恰恰在日常场景里一次都不做）。
+#      **只读**：不抢锁、不写账本、不删任何东西。
+service/douyin-reclaimcheck.service
+service/douyin-reclaimcheck.timer
+#    ↑ 每 30 分钟一次，**开机首跑排在归档之后**（OnBootSec 20min > 归档的 10min）——
+#      否则每次重启都会假报「归档心跳不存在」。退出码 0 健康 / 1 有告警。
+#      ⚠️ 它**不替代** `--dump-ledger -`：那个是「**允不允许删**」的当场正向证据
+#      （fail-closed、逐批 TOCTOU），这个只是「有没有出事先吱一声」的巡检。
+#      ⚠️ 也**不保证**数据内容对：逐字节核验在归档轮与笔记本的删除门禁里。
+
+# ── 定时台账（开播汇总 + 迁移清单）────────────────────────────────
+service/live_ledger.py
+#    ↑ 台账本体：每轮探**全部**主播的开播状态 → 汇总一张 xlsx（`dist/live_ledger.xlsx`）。
+#      两张表：`场次` = 迁移清单（每场标完整性，留「是否已迁移」「备注」两个人工列，
+#      **重写时按主键搬回来**）；`主播` = 名单级状态（含 ★疑似漏采）。
+#      依赖 liveMan.py / auto_crawl.py（上面已列）与那份名单，**不是**独立脚本。
+service/douyin-ledger.service
+service/douyin-ledger.timer
+#    ↑ 每 10 分钟跑一次（2026-10-16 从 30 分钟改过来：守护进程并发只采 10 个主播，
+#      **其余 147 人不再落任何数据**，台账成了他们唯一的开播记录）。与体检的分工：
+#      体检探 8 个房间看「守护还活着吗」（快、取样），台账探全部 157 人看「有没有整场
+#      漏采」（慢 50 秒、全量）—— 后者专门覆盖「大部分正常、少数几个房间僵死」这一种，
+#      2026-10-15 实测它占 44%。
+#      ⚠️ 服务里的 `--max-sessions` **必须与 douyin-crawl.service 同值**：台账靠它把
+#      「名额满了没轮到」（策略）和「真漏采了」（故障）分开，不一致会误报。
+#      顺带产出 `dist/usable_pending.csv` = **待迁移清单**（有真音视频 + 未标「已迁移」，
+#      按完整优先/体积倒序）。它是 `--delete-incomplete` 口径的**补集**，判据同源。
+
+# ── 服务与文档 ────────────────────────────────────────────────────
+service/douyin-crawl.service
+service/proxy.env.example
+service/README.md
+DEPLOY.md
+
+# ── 刻意**不传**的（列在这里是为了别再纠结一遍）──────────────────
+# lib/runtime/          bdms + sign_cli.js：liveMan.py 里零引用（已 grep 确认）。
+#                       那是研究中的 JSVMP 备用路径，当前不可用。
+# sign_v0.js            sign.js 的 Node/jsdom 变体，Python 侧未使用。
+# load_test.py          压测入口（pump/v8/network/media），生产不需要。
+# collect_full.py       单场全模态入口；生产走 auto_crawl 守护，不需要。
+# save_auth.py          写 config/auth.json。**生产全程游客态**，不需要登录态。
+# service/pull_sessions.py  ★ **笔记本侧**的拉取工具：把采完的场次拉回来 → 逐项校验 →
+#                       校验通过才通过 ssh 让服务器删掉那份（走 live_ledger.py 的
+#                       `--dump-facts` / `--manifest` / `--delete-list` 三个机器模式）。
+#                       方向是「笔记本主动**拉**」，服务器永远不需要它写入，所以不进包。
+#                       同 `pack.sh`：service/ 下**不是**每个文件都进包，这两个都是开发机侧。
+# test/                 除 validate_fullmodal 外的探针与单测，只在开发机跑。
+# legacy/               已归档的旧实现。
+# documents/            除上面那份名单外的研究文档与其它 xlsx。
+# data/  config/  lib/runtime/  运行期产物与凭据（config/ 里有代理凭据，绝不能进包）。

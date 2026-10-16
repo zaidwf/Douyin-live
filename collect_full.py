@@ -8,7 +8,7 @@
 |---|---|---|
 | 文本 | 弹幕流（chat/emoji） | WebSocket（`liveMan.py`） |
 | 数值 | 时序指标 + 事件流 + 粉丝团群体级特征 | WebSocket → `data_recorder.py` |
-| 图像 | 直播画面抽帧（jpg，原始分辨率纯画面） | ffmpeg 从流 URL 直接解码（`liveMan.MediaCapture`） |
+| 图像 | 直播画面抽帧（jpg，原始分辨率纯画面，**5s 一帧**） | ffmpeg 从流 URL 直接解码（`liveMan.MediaCapture`） |
 | 音频 | 音频片段（WAV 16kHz 单声道，30s/段连续） | HTML 解析 flv_pull_url → ffmpeg 连续切片（`liveMan.MediaCapture`） |
 | 商品 | 商品列表全部字段 | **灰豚第三方平台（直播结束后下载）** —— 代码不采集 |
 
@@ -28,6 +28,10 @@
 用法：
   python collect_full.py [抖音号] [时长秒] [抽帧间隔秒] [音频段长秒]
   python collect_full.py 56697889278 600
+
+抽帧间隔默认 **5 秒**（2026-10-14 起，此前为 10）—— 本仓库该日之前的场次都是 10s 一帧，
+而 `room.json` 不记录这个值，新旧语料混用时需自行区分。改它只影响帧数量与磁盘，
+**不影响带宽与 CPU**（实测见 `modify.md` 2026-10-14 条目）。
 """
 import io
 import sys
@@ -42,7 +46,7 @@ DEFAULT_LIVE_ID = "56697889278"   # 与辉同行
 
 
 def collect_full(live_id: str = DEFAULT_LIVE_ID, duration: int = 600,
-                 frame_interval: int = 10, audio_segment: int = 30) -> dict:
+                 frame_interval: int = 5, audio_segment: int = 30) -> dict:
     """单场全模态采集：主播信息 → WS（文本/数值）→ 音视频（MediaCapture）"""
     start = datetime.now()
     print(f"[{start.strftime('%H:%M:%S')}] 全模态采集 直播间={live_id} 时长={duration}s")
@@ -115,6 +119,6 @@ if __name__ == "__main__":
                                   errors='replace', line_buffering=True)
     live_id = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_LIVE_ID
     duration = int(sys.argv[2]) if len(sys.argv) > 2 else 600
-    frame_interval = int(sys.argv[3]) if len(sys.argv) > 3 else 10
+    frame_interval = int(sys.argv[3]) if len(sys.argv) > 3 else 5
     audio_segment = int(sys.argv[4]) if len(sys.argv) > 4 else 30
     collect_full(live_id, duration, frame_interval, audio_segment)

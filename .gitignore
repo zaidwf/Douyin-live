@@ -2,6 +2,13 @@ __pycache__/
 *.pyc
 *.pyo
 .vscode/
-test_result/
 *.log
 *.png
+lib/
+data/
+config/
+modify.md
+error/
+analysis/
+test_result/
+service/dist/

@@ -1,0 +1,50 @@
+[Unit]
+Description=Douyin Live 归档到 COS（one-shot，整场打包传腾讯云）
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Type=oneshot：跑完即退，退出码即判定
+# （0 正常 / 1 有场次失败 / 3 上一轮还在跑 / 4 凭据或环境错）。
+#
+# ★ 挂这个 timer 解决了什么（2026-10-16，用户选「方案 A 双机分工」）：
+#   整条回收链路（服务器→COS 归档、笔记本→拉文本、门禁通过后删服务器）此前**全程手动** ——
+#   15:13 之后没人碰，4 小时就积压 180 场 / 12.6 GB，磁盘只剩 19 G 可用、约 6.6 小时触到
+#   `--min-free-gb 5` 的降级阈值。本单元负责链路第 ① 步，也是**唯一必须在服务器上做**的
+#   一步：走内网 59 MB/s，公网只有 0.33 MB/s（差 178 倍）。
+#
+# ★ 它**不删**服务器那份（默认行为，故意的）：删除必须由笔记本发起 ——
+#   `pull_sessions.py` 里有 `assert '--delete-after-upload' not in cmd`，笔记本绝不允许
+#   服务器自删，因为三道门禁（文本腿 / COS 活证据 / TOCTOU）**只在笔记本上存在**。
+#   所以**这个 timer 跑得再勤也不省磁盘**，磁盘回收天然依赖笔记本那台机器还开着；
+#   它的价值是「让数据尽快进 COS」，笔记本关机期间数据也不会只躺在服务器上。
+#
+# ⚠️ **绝不要**拿它的退出码当「数据已经在 COS」的证据（见 `cos_archive.py` 模块顶部与
+#   `service/README.md` 第四节）：退出 0 只说明「我跑完了」—— `--only` 打错、场次被跳过
+#   都静默返回 0，而 HEAD 复查排在「没有要传的场次」之后，恰恰在「全都已归档」这个最
+#   需要确认对象还在的场景里一次 HEAD 都不做。要证据只有 `--dump-ledger -` 的逐条活 HEAD。
+#   所以 `systemctl --failed` 在这里只说明「归档这一轮挂了」，**不**保证数据安全。
+#
+# ⚠️ 撞锁返回 EXIT_LOCKED(3) 会被 systemd 记成 failed —— **故意不豁免**：1 小时周期对
+#   上一轮实测 2 分钟的运行时间有 30 倍余量，真撞上说明归档变慢了，值得亮出来看一眼。
+Type=oneshot
+User=root
+WorkingDirectory=/opt/douyin-live
+# 凭据在 config/cos.env（root:root 600），所以**必须 root 跑**：非 root 读不到 → 恒返
+# EXIT_ENV(4)。它是读这个**文件**（`load_cos_env()`），不是读环境变量，所以这里不需要
+# EnvironmentFile —— 也**不要**为了让别的目的去加，那会把 cos.env 的密钥灌进进程环境。
+ExecStart=/opt/douyin-live/venv/bin/python /opt/douyin-live/service/cos_archive.py
+
+# 不加 Restart=always / on-failure，理由同 douyin-ledger.service：跑完即退的单元加 always
+# 会死循环刷 journal；on-failure 会把失败重试成成功，`systemctl --failed` 这个告警面就瞎了。
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=douyin-archive
+
+# 2026-10-16 实测：169 场 / 7.85 GB 用了约 2 分钟（内网 59 MB/s）。给足余量但别无限等 ——
+# 超时会被 SIGKILL，那一轮整个丢掉（下一轮会自动重传：账本里没有记录）。
+TimeoutStartSec=1800
+
+[Install]
+WantedBy=multi-user.target

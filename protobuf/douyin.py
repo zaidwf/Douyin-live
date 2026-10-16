@@ -737,7 +737,17 @@ class HeadersList(betterproto.Message):
 class LiveShoppingMessage(betterproto.Message):
     common: "Common" = betterproto.message_field(1)
     msg_type: int = betterproto.int32_field(2)
-    promotion_id: int = betterproto.int64_field(4)
+    promotion_id: int = betterproto.int64_field(3)
+
+
+@dataclass
+class LiveEcomGeneralMessage(betterproto.Message):
+    """电商通用消息（购买通知，type='LivePopMessage'）"""
+    common: "Common" = betterproto.message_field(1)
+    type: str = betterproto.string_field(2)
+    content_type: str = betterproto.string_field(3)
+    timestamp: int = betterproto.int64_field(4)
+    biz_content: bytes = betterproto.bytes_field(6)
 
 
 @dataclass
@@ -779,6 +789,20 @@ class ProductChangeMessage(betterproto.Message):
     update_product_info_list: List["ProductInfo"] = betterproto.message_field(4)
     total: int = betterproto.int64_field(5)
     update_category_info_list: List["CategoryInfo"] = betterproto.message_field(8)
+
+
+@dataclass
+class AwemeShopExplainMessage(betterproto.Message):
+    """讲解状态消息（Extra.active 表示该商品是否正在讲解）"""
+
+    common: "Common" = betterproto.message_field(1)
+    extra: "AwemeShopExplainMessageExtra" = betterproto.message_field(2)
+
+
+@dataclass
+class AwemeShopExplainMessageExtra(betterproto.Message):
+    promotion_id: int = betterproto.uint64_field(1)
+    active: bool = betterproto.bool_field(2)
 
 
 @dataclass

@@ -1,0 +1,46 @@
+[Unit]
+Description=Douyin Live Ledger (one-shot, 开播台账 + 场次完整性标注)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Type=oneshot：跑完就退，**退出码就是判定**（0 正常 / 1 探测全失败或有「疑似漏采」）。
+# 与 health_check 同一套告警面：`systemctl --failed` 直接列出来。
+#
+# 与体检的分工（两个都想装，缺一不可）：
+#   体检（10 分钟）= 「守护进程还活着吗」—— 探 8 个房间 × 产出新鲜度，交叉判定；
+#   台账（10 分钟）= 「有没有整场漏采」+ 「谁开播了」—— 探**全部**主播 × 逐场次完整性。
+# 体检取样、快，但可能漏掉「大部分正常、少数几个房间僵死」；台账全量、慢（157 人实测
+# 约 6 分钟），专门覆盖这一种。今天那个 44% 漏采就是体检报「健康」而实际发生的。
+#
+# 2026-10-16 起守护进程改为「**并发只采 10 个主播**，其余只探开播状态」，所以台账又多了
+# 一个职责：**它现在是「其余 147 人」唯一的开播状态记录**（那些人不再落任何数据）。
+# 周期也从 30 分钟改成 10 分钟，与用户的策略一致。
+Type=oneshot
+User=root
+WorkingDirectory=/opt/douyin-live
+# --max-sessions 必须和 douyin-crawl.service 的**同一个值**：台账靠它把「名额已满所以
+# 没在采」和「真的漏采了」区分开。填错（比如台账填 0）会让 `疑似漏采` 爆表、退出码恒为 1。
+ExecStart=/opt/douyin-live/venv/bin/python /opt/douyin-live/service/live_ledger.py \
+          --max-sessions 10
+
+# 和 douyin-crawl / health_check 读**同一份**代理配置，理由同上：
+# 台账探的必须是被守护进程实际使用的那条隧道。
+EnvironmentFile=-/opt/douyin-live/config/proxy.env
+Environment=PYTHONUNBUFFERED=1
+
+# ⚠️ **不要**加 Restart=always 或 Restart=on-failure：这是跑完即退的单元，
+# always 会变成死循环刷 journal；on-failure 会把失败信号重试成成功，
+# `systemctl --failed` 就看不见「有主播在播却没在采」了。
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=douyin-ledger
+
+# 157 人探测 + 扫 data/ 的场次目录（几千个文件）。**实测 357 秒**（含限流；旧机记的
+# 50 秒是没限流时的数），给足余量但不无限等 —— 超时会被 systemd SIGKILL，那一次
+# 观测就整个丢了。注意它和 10 分钟的周期是同一个量级，**别把周期再往下调**。
+TimeoutStartSec=900
+
+[Install]
+WantedBy=multi-user.target
