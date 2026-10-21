@@ -105,6 +105,8 @@ def collect_full(live_id: str = DEFAULT_LIVE_ID, duration: int = 600,
     print(f"  音频        : {len(media['audio'])} 段")
     if media['restarts']:
         print(f"  音视频续采  : {media['restarts']} 次（流地址过期后重解析）")
+    if media.get('stalls'):
+        print(f"  音视频停滞  : {media['stalls']} 次（ffmpeg 活着但不出数 → 强杀重拉）")
     print(f"  商品        : 由灰豚提供（直播结束后下载），代码侧不采集")
     print(f"  总时长      : {elapsed / 60:.1f} 分钟")
     print("=" * 74)

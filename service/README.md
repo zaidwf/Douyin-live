@@ -267,7 +267,7 @@ systemctl --failed                                  # 探测全失败 / 有疑�
 
 | 数据 | 去哪 | 通路 | 实测量级 |
 |---|---|---|---|
-| 顶层文本/数值（8 种文件） | 笔记本 `D:\shock\Documents\data` | 公网 ssh+rsync | 顶层只占全库 **0.5%**（约 1 MB/场），85 MB 全量 ≈ **4.3 分钟** |
+| 顶层文本/数值（8 种文件） | 笔记本 `D:\CodeFile\GithubProjects\Tiktok-live\data` | 公网 ssh+rsync | 顶层只占全库 **0.5%**（约 1 MB/场），85 MB 全量 ≈ **4.3 分钟** |
 | **整场**（文本 **+** 音视频，每场一个 tar） | COS | 内网 | 59 MB/s、**免费**（见下一节） |
 
 两条腿**都只处理 `completeness == '完整'` 的场次**（用户指定）。**采集中 / 不完整 /
@@ -277,7 +277,7 @@ systemctl --failed                                  # 探测全失败 / 有疑�
 笔记本上的布局：
 
 ```
-D:\shock\Documents\data\
+D:\CodeFile\GithubProjects\Tiktok-live\data\
   20261016\live_<...>_20261016_101500\
       room.json  danmaku.jsonl  events.jsonl  series.json  series.jsonl
       fansclub_edges.jsonl  session_meta.json  ffmpeg_media.log    ← 顶层 8 种，全在这
@@ -288,6 +288,8 @@ D:\shock\Documents\data\
 
 **笔记本上的场次目录不再与服务器逐字节一致**：只有顶层文本 + 指针。
 要媒体就按指针里的 `key` 从 COS 取（下载 tar → `tar -xf` → 与本地目录合并）。
+**>4 GiB 的场次看 `parts`**：COS 上是多个独立对象（`.tar.part000` …），
+按顺序 `cat part* > live_x.tar` 合并后再解包；`key` 只是逻辑键，对象并不存在。
 指针**故意放进场次目录** —— 用户会「满了自己挪盘」，指针必须跟着目录走。
 （下划线前缀，避免与服务器将来可能产出的同名文件撞车；`text_manifest()` 会把它
 从**两侧**一起滤掉，所以它不会让校验恒判不一致。）
@@ -433,8 +435,14 @@ COS 上的布局，与服务器 `data/` 同构：
 
 ```
 <bucket>/data/<8位日期>/<场次名>.tar             场次本体（tar，**不压缩**）
+<bucket>/data/<8位日期>/<场次名>.tar.partNNN     >4 GiB 的场次拆成的独立对象
 <bucket>/data/<8位日期>/<场次名>.manifest.json    逐文件清单（存档那一刻的真相）
 ```
+
+**>4 GiB 不是 multipart，而是多个普通对象**（2026-10-20 实测：当前子账号
+`POST ?uploads` 恒 403 AccessDenied，普通 PUT 200）。每片 ≤4 GiB，`cat part* > live_x.tar`
+即还原。账本 `key` 仍是规范 tar 键，实际对象在 `parts` 里；`object_present` 要求每一片
+都在且字节数对。
 
 `.manifest.json` 是刻意存的：服务器那份一删，「这场该有哪些文件」的权威记录就只剩它了。
 以后笔记本从 COS 取时，解 tar → `live_ledger.dir_manifest()` → 与它逐项比对，
@@ -442,8 +450,9 @@ COS 上的布局，与服务器 `data/` 同构：
 解包 → `dir_manifest` 的 digest 与服务器目录**逐字节相同**。）
 
 **`--dump-ledger -`（笔记本的唯一正向证据）**：输出 `{dir: rec}`，其中每条 `verify=='ok'`
-的记录**多一个 `object_present`** —— 用既有的 `Cos.size_of(session_key(rel)) is not None`，
-与轮里那步判「对象还在不在」用的是**同一个判据**，不另造一个。它**不抢锁**（纯读），
+的记录**多一个 `object_present`** —— 走 `record_present()`，内部用既有的 `Cos.size_of`，
+与轮里那步判「对象还在不在」用的是**同一个判据**；分片记录要求**每一片都在且字节数对**
+（只查第一片会漏掉「后一片被删」的静默丢失）。它**不抢锁**（纯读），
 但**需要凭据**（要 HEAD）—— 所以在 `load_cos_env()` 之后、`acquire_lock()` 之前短路。
 ⚠️ 因此调用它的那条 ssh **必须带 `sudo -n`**：`config/cos.env` 是 `root:root 600`，
 不给 sudo 就读不到凭据，工具会 fail-closed 地把**全部对象报成「不在」**（`EXIT_ENV`），
@@ -504,11 +513,27 @@ systemctl start douyin-reclaimcheck.service   # 立刻体检一次（或等它�
 但会让第一次装的人以为装坏了。
 
 ```cmd
-:: 笔记本侧
+:: 笔记本侧：★ 用 pythonw.exe（无控制台 → 定时跑不弹黑窗），排查时才换回 python.exe
 schtasks /Create /TN "DouyinPull" /SC MINUTE /MO 30 /F ^
-  /TR "\"<python.exe 绝对路径>\" \"<repo>\service\pull_sessions.py\" --no-cos --quiet"
+  /TR "\"<pythonw.exe 绝对路径>\" \"<repo>\service\pull_sessions.py\" --no-cos --quiet"
 schtasks /Query /TN "DouyinPull" /V /FO LIST | findstr /C:"上次运行结果" /C:"下次运行时间"
 ```
+
+**静默执行**（不弹窗）要同时满足两条，缺一条就会看到黑窗：
+
+1. 计划任务的可执行文件是 **`pythonw.exe`**（不是 `python.exe`）。`pythonw` 不分配控制台，
+   进程本身没有窗口。
+2. 脚本里所有子进程（`ssh.exe` / `rsync.exe`，都是控制台程序）带 **`CREATE_NO_WINDOW`**
+   （`pull_sessions.run()` 里的 `creationflags`）。父进程没有控制台时，子进程**默认会
+   各自新建一个窗** —— 那样每轮会闪好几个小黑窗，比一个大窗更烦。
+
+日志不受影响（`service/dist/pull_sessions.log` 照写）。但 **`pythonw` 下没有任何 stdout**，
+所以自检/排查请用 `python.exe` 手工跑：`python service/pull_sessions.py --selftest`。
+
+⚠️ 本地 `rsync`/`ssh` **必须同源**：都取 `D:\code\msys2-rsync\usr\bin` 下那一对
+（调 Git 自带的或 Windows 自带的 ssh 都有确定报错），且本地路径要写 MSYS2 的 `/d/...`
+形式（工具内已用 `to_msys()` 转换）。**不要**把那个 `usr\bin` 加进系统 PATH —— 会顶掉
+Git 的 ssh，`git push` 会坏；工具只用子进程级 PATH + 绝对路径。详见该前缀的 `README.md`。
 
 **四个必须记住的点**：
 

@@ -47,6 +47,7 @@ python service/live_ledger.py --no-probe --delete-incomplete --apply   # 真删�
 python service/live_ledger.py --no-probe --delete-migrated --apply     # 真删已迁走的
 python service/live_ledger.py --usable-csv ''                         # 不生成待迁移清单 CSV
 python test/test_stall_watchdog_unit.py                 # WS 僵死判据 + session_meta.json（离线）
+python test/test_media_stall_unit.py                    # 媒体停滞判据：ffmpeg 活着但不出数 → 强杀重拉（离线）
 python test/test_ws_reconnect_unit.py                   # WS 断线同场次重连 + 默认关不变量（离线）
 python test/test_session_gate_unit.py                   # 会话闸门：抢不到名额就完全不采（离线）
 python test/test_ledger_unit.py                         # 台账：完整性判定/人工列/删除保护（离线）
@@ -74,9 +75,11 @@ python test/test_reclaim_check_unit.py                 # 三条判据的真值�
 sudo cp /opt/douyin-live/service/douyin-archive.{service,timer} /etc/systemd/system/
 sudo cp /opt/douyin-live/service/douyin-reclaimcheck.{service,timer} /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now douyin-archive.timer douyin-reclaimcheck.timer
-schtasks /Create /TN "DouyinPull" /SC MINUTE /MO 30 /F /TR "\"<python.exe>\" \"<repo>\service\pull_sessions.py\" --no-cos --quiet"
+schtasks /Create /TN "DouyinPull" /SC MINUTE /MO 30 /F /TR "\"<pythonw.exe>\" \"<repo>\service\pull_sessions.py\" --no-cos --quiet"
 #    ↑ 笔记本这条**必须带 `--no-cos`**（否则和服务器 timer 抢锁空转），
-#      且装完必须关掉电池限制（默认「用电池时不启动」，笔记本一拔电源链路就断）
+#      且装完必须关掉电池限制（默认「用电池时不启动」，笔记本一拔电源链路就断）；
+#      用 `pythonw.exe` 而不是 `python.exe`（无控制台 → 定时跑不弹黑窗，子进程靠
+#      `pull_sessions.CREATE_NO_WINDOW` 也不弹；排查时手工用 python.exe 跑 --selftest）
 
 bash service/pack.sh                                    # 按 service/MANIFEST 打服务器部署包
 python service/run_5anchors.py --anchors 5 --duration 600   # 5 主播并发全模态实测编排器
@@ -142,6 +145,15 @@ python service/run_5anchors.py --anchors 5 --duration 600   # 5 主播并发全�
 而且它的 HEAD 复查在 `if not todo: return` **之后** —— 恰恰在「全都已归档」这个最需要
 确认对象还在的场景里一次 HEAD 都不做）。默认**不删**服务器那份；日常删除由**笔记本
 门禁通过后**发起（`--delete-after-upload` 反而要显式加，且别和本工具同跑）。
+
+**★ >4 GiB 的场次是「多个分片对象」，不是 multipart（2026-10-20 实测）。** COS 单 PUT
+上限 5 GiB，一场 5.03 GiB 的 tar 曾在末段 `SSLEOFError`。当前 `cos.env` 这把子账号
+**没有分片上传权限**：`POST ?uploads`（InitiateMultipartUpload）恒返回 **403 AccessDenied**，
+而同一前缀的普通 `PUT` 是 200。所以工具把 tar 按 **4 GiB** 切成 `….tar.part000`、
+`.part001` …**独立对象**逐个 PUT；`cat part* > live_x.tar` 即还原。账本里的 `key`
+仍是规范 tar 键（笔记本门禁按它比对），`object_present` 要求**每一片都在且字节数对**
+（只查第一片会漏掉「后一片被删」的静默丢失）；`_local_cos_media.json` 的 `parts`
+才是取媒体的真实位置。`--selftest` 会用 10 MiB/4 MiB 真发 3 个分片对象做往返验证。
 
 **★ 两条腿的分工与三道删除门禁（2026-10-16 实测：一轮删 91 场 / 18.21 GB，
 根盘可用 14G→31G、`data/` 18G→1.2G）**：`service/pull_sessions.py`（**笔记本侧，
@@ -375,6 +387,33 @@ journald 排查**（日志会轮转掉）。`skip_reason` 是关键：`gate_no_s
 真 444 是 **0** 行。判据是单一来源：`err_text()` 在 `err.response.status_code == 444` 时
 打稳定标记 `[风控444]`（按状态码判，不依赖 requests 拼的英文措辞），
 `is_risk_control_444()` 同时认新标记与历史日志里的旧措辞。
+
+**⚠️ 音视频在「整 8 小时」处断流有两个来源，两条续采判据缺一不可（2026-10-17/18 实测）**：
+「**帧 5760 / 音频 960**」（= 480 分钟 × 12 帧/分、× 2 段/分，最后一帧在开场后
+**8h00m05~07s**）这个签名出现两次，原因**不同**：
+
+① **我们自己的 `-t 28800`**（`auto_crawl.MEDIA_MAX_SECONDS = 8h`，单进程防僵尸上限）：
+健康流会在整 8 小时处**正常退出**。2026-10-18 23:00 实测三场 15:00 开播的场次：一场
+恰好被续采（帧数 5760 → 5856，ffmpeg 带 `-start_number 5760` 重拉），另两场的 ffmpeg
+变成 `<defunct>` 僵尸、**一声没吭** —— 根因是旧 `_watchdog` 里那句「`-t` 到点属于
+正常结束」直接 `return`：**停止监视**之后，8 小时后的这次退出根本没人判。媒体永久停在
+5760 帧，文本照常，所有指标看起来都正常。**修法：删掉那句 `return`** —— `-t` 只是
+单进程上限，不是本场结束；本场结束的唯一信号是 `_stop_event`（`stop_media()` 置位）。
+② **CDN 停推**（10-17 三场）：ffmpeg **仍存活**（CPU 仍占 1.4–1.7%），只是再也不写文件
+—— 这种「活着但不出数」用 `proc.poll()` 永远发现不了。
+
+第二条判据是 `MediaCapture._stalled_modalities`：某模态的**产物文件计数**在
+`MEDIA_STALL_SECONDS`（300s）内一次没涨 → **强杀进程**（`_spawn` 见到引用非 None 会直接
+返回，不杀就起不来新的）+ 重解析流地址续采。计数用**非空文件个数**而不是 mtime
+（帧 5s/个、音频段 30s/段，个数单调增加），阈值按 `max(media_stall, 2 × 段长/帧间隔)`
+放宽。`media.stalls`（停滞强杀）与 `media.restarts`（进程退出 / `-t` 到点续采）**分开记**，
+都写进 `session_meta.json`；`media_stall=0` 关闭。停滞判据的有效性已验证：对停摆 2.5
+小时的房间用新解析的地址拉 20 秒 → **4 帧 + 1 段音频**。
+⚠️ 停滞路径（②）还**没有**在真实 8 小时边界上自动触发过（10-18 那次是 ①）；部署后若
+看到 `session_meta.media.stalls ≥ 1`，那才是 ② 的第一次实弹。
+⚠️ 两条判据都在**守护进程内**，改动后**必须重启进程**才生效。正常 SIGTERM 会走
+`recorder.close()`，所以重启截断的场次仍有 `room.json`；只要文本+音视频都在，台账仍判
+「完整」（`stop_reason='signal'` 不影响完整性判定）。
 
 **音视频单路成本（2026-10-14 实测，非估算）**：默认路径是**一个 ffmpeg 进程**（合并音视
 + `-skip_frame nokey`），一路约 **0.023 核 / 162 MB RSS / 6.2 Mbps**。改动前是**两个**进程

@@ -21,7 +21,12 @@
 ## COS 上的目录约定
 
     <bucket>/data/<8位日期>/<场次名>.tar            场次本体（tar，**不压缩**）
+    <bucket>/data/<8位日期>/<场次名>.tar.partNNN     >4 GiB 的场次拆成的独立对象
     <bucket>/data/<8位日期>/<场次名>.manifest.json   逐文件清单（存档那一刻的真相）
+
+>4 GiB 的 tar **不是 multipart**，而是多个普通对象（当前子账号没有分片上传权限）：
+`cat live_x.tar.part000 live_x.tar.part001 > live_x.tar` 即还原。账本里的 `key` 仍是
+规范 tar 键（笔记本门禁按它比对），实际对象在 `parts` 里。
 
 `.manifest.json` 是刻意存的：服务器那份一旦删掉，「这场到底该有哪些文件」的权威记录就
 只剩它了。以后笔记本从 COS 拉回来时，解 tar → `live_ledger.dir_manifest()` → 与它逐项比对，
@@ -117,6 +122,19 @@ SIGN_EXPIRE = 3600                                    # 签名有效期（秒）
 CONNECT_TIMEOUT = 15
 READ_TIMEOUT = 1800                                   # 1.5 GB / 59 MB/s ≈ 27 s，给足余量
 
+# COS 单 PUT 上限 **5 GiB**。超过它的 tar 必须拆成多个对象 —— 2026-10-19 实测一场
+# 5,399,797,760 B（5.03 GiB）的场次连续两次在上传末段报 SSLEOFError，COS 上不留对象。
+# 阈值取 4 GiB，给「接近上限但还没超」的场次留余量。
+#
+# ⚠️ 为什么不是**分片上传（multipart）**：2026-10-20 用当前 `cos.env` 的凭据实测，
+# `POST ?uploads`（InitiateMultipartUpload）恒返回 **403 AccessDenied**，而同一把 key
+# 对同一前缀的普通 `PUT` 是 200 —— 这把子账号只有 PutObject 权限，没有分片接口权限。
+# 所以走「**每个 ≤4 GiB 的独立对象**」：`<场次>.tar.part000`、`.part001` ……
+# 每个都用普通 PUT（同一把 key 已证明可用），拼回来就是 `cat part* > live_x.tar`。
+# 账本里仍保留逻辑键 `key`（规范 tar 键，笔记本门禁按它比对），真正的对象列在 `parts`。
+SHARD_THRESHOLD = 4 * 1024 ** 3
+SHARD_SIZE = 4 * 1024 ** 3                            # 4 GiB/片；5.03 GiB → 2 片
+
 EXIT_OK, EXIT_FAIL, EXIT_ENV, EXIT_LOCKED = 0, 1, 4, 3
 
 
@@ -192,7 +210,7 @@ def _q(s):
 
 
 def cos_authorization(method, key, headers, secret_id, secret_key,
-                      start=None, expire=SIGN_EXPIRE):
+                      start=None, expire=SIGN_EXPIRE, params=None):
     """算 COS V5 的 `Authorization` 头。**纯函数**（给了 `start` 就完全确定，可离线单测）。
 
     ```
@@ -210,6 +228,9 @@ def cos_authorization(method, key, headers, secret_id, secret_key,
     3. 参与签名的头只认三类：`host`、`content-type`/`content-length`、`x-cos-*`。
        其余（如 `User-Agent`）即使发出去也不进签名 —— 所以 requests 自己加的头部
        不会破坏签名。
+    4. 查询参数（分片上传的 `uploads` / `partNumber` / `uploadId`）也必须参与签名；
+       没有参数时 `canon_params` 与 `q-url-param-list` 都为空 —— 与改动前的单 PUT
+       逐字节一致（`[1b]` 的已知值回归锁不受影响）。
     """
     if start is None:
         start = int(datetime.now().timestamp())
@@ -225,7 +246,13 @@ def cos_authorization(method, key, headers, secret_id, secret_key,
     header_list = ';'.join(sorted(signed))
     canon_headers = '&'.join(f'{_q(k)}={_q(v)}' for k, v in sorted(signed.items()))
     uri = '/' + _q(key).replace('%2F', '/')           # 路径里的 `/` 不编码
-    http_string = f'{method.lower()}\n{uri}\n\n{canon_headers}\n'
+    # 查询参数也必须进签名（分片上传的 ?uploads / ?partNumber=…&uploadId=…）：
+    # COS 的 canonical query string 按键名排序、`&` 连接；q-url-param-list 用 `;`。
+    params = {str(k).lower(): str(v) for k, v in (params or {}).items()}
+    param_items = sorted(params.items())
+    canon_params = '&'.join(f'{_q(k)}={_q(v)}' for k, v in param_items)
+    param_list = ';'.join(k for k, _ in param_items)
+    http_string = f'{method.lower()}\n{uri}\n{canon_params}\n{canon_headers}\n'
     string_to_sign = ('sha1\n' + key_time + '\n'
                       + hashlib.sha1(http_string.encode('utf-8')).hexdigest() + '\n')
     signature = hmac.new(sign_key.encode('utf-8'), string_to_sign.encode('utf-8'),
@@ -236,11 +263,86 @@ def cos_authorization(method, key, headers, secret_id, secret_key,
             f'&q-sign-time={key_time}'
             f'&q-key-time={key_time}'
             f'&q-header-list={header_list}'
-            '&q-url-param-list='
+            f'&q-url-param-list={param_list}'
             f'&q-signature={signature}')
 
 
 # ================================================================ COS 侧副作用
+def shard_plan(size, shard_size=SHARD_SIZE):
+    """`size` 字节按 `shard_size` 切片 → `[(index, offset, length), …]`。
+
+    index 从 **0** 开始（对象名后缀用）。最后一片是余数；空文件返回空列表。
+    **纯函数**，单测直接喂边界值，不需要网络。
+
+    与 multipart 的 partNumber 无关：这是**多个独立对象**，每个都走普通 PUT。
+    """
+    if size <= 0 or shard_size <= 0:
+        return []
+    return [(i, i * shard_size, min(shard_size, size - i * shard_size))
+            for i in range((size + shard_size - 1) // shard_size)]
+
+
+def shard_key(key, index):
+    """逻辑键 `….tar` → 实际对象键 `….tar.part000`（**逻辑键本身不会存在**）。"""
+    return f'{key}.part{index:03d}'
+
+
+def record_parts(rec):
+    """账本记录 → 实际的 COS 对象列表 `[{'key', 'bytes'}, …]`。
+
+    老记录（分片方案之前）没有 `parts` → 唯一对象就是规范 tar 键。
+    """
+    parts = rec.get('parts')
+    if parts:
+        return parts
+    return [{'key': rec.get('key') or session_key(rec.get('dir', '')),
+             'bytes': rec.get('tar_bytes')}]
+
+
+def record_present(cos, rec):
+    """账本说已归档的那份数据，**此刻**是否完整躺在 COS 上。
+
+    分片记录要求**每一片都在、且字节数与账本一致** —— 只查第一片会让「第二片被生命周期
+    规则删掉」这种静默丢失漏过去，而那正是这个函数存在的理由。
+    """
+    for p in record_parts(rec):
+        key = p.get('key')
+        if not key:
+            return False
+        remote = cos.size_of(key)
+        if remote is None:
+            return False
+        want = p.get('bytes')
+        if want is not None and remote != want:
+            return False
+    return True
+
+
+class _SliceReader:
+    """把已 seek 到 offset 的文件句柄**只读 length 字节**交给 requests（不进内存）。
+
+    4 GiB 一片直接 `fh.read()` 会把整片读进内存 —— 这台机器 2 GB 内存、无 swap，
+    等于自杀。requests 流式读它时每次只拿 8 KiB 左右，所以 `__len__` 必须给出**剩余**
+    字节数（它会被用来填 Content-Length；我们也显式设了该头，双保险）。
+    """
+
+    def __init__(self, fh, length):
+        self._fh = fh
+        self._left = length
+
+    def read(self, n=-1):
+        if self._left <= 0:
+            return b''
+        if n is None or n < 0:
+            n = self._left
+        data = self._fh.read(min(n, self._left))
+        self._left -= len(data)
+        return data
+
+    def __len__(self):
+        return self._left
+
+
 class Cos:
     """极简 COS 客户端：只需 PUT / HEAD / DELETE 三个动作，所以不引 SDK。"""
 
@@ -256,19 +358,25 @@ class Cos:
     def url(self, key):
         return f'{self.base}/{key}'
 
-    def _headers(self, method, key, extra=None):
+    def _headers(self, method, key, extra=None, params=None):
         h = {'Host': self.host}
         h.update(extra or {})
         h['Authorization'] = cos_authorization(
-            method, key, h, self.cfg['COS_SECRET_ID'], self.cfg['COS_SECRET_KEY'])
+            method, key, h, self.cfg['COS_SECRET_ID'], self.cfg['COS_SECRET_KEY'],
+            params=params)
         return h
 
     def put_file(self, key, path, meta=None):
         """从一个**文件**上传（流式，不进内存）。返回 `(状态码, 响应头, 文本片段)`。
 
-        单个 PUT 上限 5 GB，而我们最大的场次 tar 只有 1.6 GB，所以不做分片。
+        只用于 ≤4 GiB 的对象（tar 统一走 `put_sharded()`；manifest 很小）。
+        超过 COS 单 PUT 上限的 tar 由 `put_sharded()` 拆成多个独立对象。
         """
         size = os.path.getsize(path)
+        if size > SHARD_THRESHOLD:
+            raise RuntimeError(
+                f'{path} 有 {size} 字节，超过单对象阈值 {SHARD_THRESHOLD}；'
+                f'必须用 put_sharded()（当前凭据没有分片上传权限）')
         extra = {'Content-Length': str(size), 'Content-Type': 'application/octet-stream'}
         for k, v in (meta or {}).items():
             extra['x-cos-meta-' + k] = str(v)
@@ -277,6 +385,66 @@ class Cos:
             r = self.s.put(self.url(key), data=fh, headers=headers,
                            timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
         return r.status_code, dict(r.headers), r.text[:300]
+
+    def put_shard(self, key, path, offset, length, meta=None):
+        """把文件的一个**字节区间**作为一个独立对象上传（流式，不进内存）。"""
+        extra = {'Content-Length': str(length), 'Content-Type': 'application/octet-stream'}
+        for k, v in (meta or {}).items():
+            extra['x-cos-meta-' + k] = str(v)
+        headers = self._headers('put', key, extra)
+        with open(path, 'rb') as fh:
+            fh.seek(offset)
+            r = self.s.put(self.url(key), data=_SliceReader(fh, length),
+                           headers=headers, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
+        return r.status_code, dict(r.headers), r.text[:300]
+
+    def put_sharded(self, key, path, meta=None, shard_size=SHARD_SIZE):
+        """把一个大文件传成**一组独立对象** `key` 或 `key.part000…`，返回 `parts` 列表。
+
+        - ≤4 GiB：普通单对象，`parts` 只有一项（键就是 `key`）。
+        - >4 GiB：按 `shard_size` 切片，每片是一个独立对象；**不合并**，拼回来是
+          `cat live_x.tar.part000 live_x.tar.part001 > live_x.tar`。
+        - 每一片传完都当场 HEAD 比字节数；任何一片失败 → 删掉本轮已传的片再抛异常，
+          避免桶里留下一组「看起来有、其实不全」的半成品。
+
+        为什么不用 COS 的 multipart：InitiateMultipartUpload 在**当前子账号**上是 403
+        （见模块顶部 SHARD_* 注释），普通 `PUT` 才是这把 key 被允许的动作。
+        """
+        size = os.path.getsize(path)
+        plan = shard_plan(size, shard_size)
+        if len(plan) <= 1:
+            code, hdrs, body = self.put_file(key, path, meta=meta)
+            if code != 200:
+                raise RuntimeError(f'上传失败 HTTP {code}：{body[:200]}')
+            remote = self.size_of(key)
+            if remote != size:
+                self.delete(key)
+                raise RuntimeError(f'核验不过：本地 {size} / COS 上 {remote}')
+            return [{'key': key, 'bytes': size,
+                     'etag': hdrs.get('ETag', '').strip('"')}]
+
+        parts = []
+        try:
+            for index, offset, length in plan:
+                pkey = shard_key(key, index)
+                code, hdrs, body = self.put_shard(pkey, path, offset, length, meta=meta)
+                if code != 200:
+                    raise RuntimeError(
+                        f'第 {index} 片（{length} 字节）上传失败 HTTP {code}：{body[:200]}')
+                remote = self.size_of(pkey)
+                if remote != length:
+                    raise RuntimeError(
+                        f'第 {index} 片核验不过：本地 {length} / COS 上 {remote}')
+                parts.append({'key': pkey, 'bytes': length,
+                              'etag': hdrs.get('ETag', '').strip('"')})
+        except Exception:
+            for p in parts:                 # 本轮已传的片清掉，重传时不留半成品
+                try:
+                    self.delete(p['key'])
+                except Exception:
+                    pass
+            raise
+        return parts
 
     def head(self, key):
         """返回 `(状态码, 响应头 dict)`。404 → `(404, {})`，不抛异常。"""
@@ -599,7 +767,34 @@ def selftest():
     except Exception as e:
         chk('往返测试', False, f'{type(e).__name__}: {e}')
 
-    print('4) 本地前提')
+    print('4) 分片对象（>4 GiB 场次走这条路；不是 multipart）')
+    skey = f'{PREFIX}/_selftest/shard.bin'
+    spath = os.path.join(TMP_DIR, f'_selftest_shard_{os.getpid()}.bin')
+    try:
+        os.makedirs(TMP_DIR, exist_ok=True)
+        size = 10 * 1024 * 1024 + 123
+        with open(spath, 'wb') as fh:
+            fh.write(os.urandom(size))
+        parts = cos.put_sharded(skey, spath, meta={'probe': 'shard'},
+                                shard_size=4 * 1024 * 1024)
+        chk('★ 10 MiB / 4 MiB → 3 个独立对象', len(parts) == 3, f'{len(parts)} 片')
+        chk('★ 每片 HEAD 字节数都对',
+            all(cos.size_of(p['key']) == p['bytes'] for p in parts))
+        fake = {'key': skey, 'tar_bytes': size, 'parts': parts}
+        chk('★ record_present 认全部分片', record_present(cos, fake))
+        for p in parts:
+            cos.delete(p['key'])
+        chk('★ 缺任一分片 → record_present 为假（不会只看第一片）',
+            not record_present(cos, fake))
+    except Exception as e:
+        chk('分片对象往返', False, f'{type(e).__name__}: {e}')
+    finally:
+        try:
+            os.remove(spath)
+        except OSError:
+            pass
+
+    print('5) 本地前提')
     chk('tar 可执行', shutil.which('tar') is not None, shutil.which('tar') or '')
     st = os.statvfs(DIST if os.path.isdir(DIST) else ROOT)
     free_gb = st.f_bavail * st.f_frsize / 1e9
@@ -662,7 +857,7 @@ def dump_ledger(dest):
 
         gone = []
         for d in pending:
-            present = cos.size_of(session_key(d)) is not None
+            present = record_present(cos, ledger[d])
             out[d]['object_present'] = present
             if not present:
                 gone.append(d)
@@ -767,7 +962,7 @@ def _cycle(args):
     # 就是「服务器那份也删了、COS 上也没有」的静默丢失。82 场 ≈ 8 秒，相对传输可忽略。
     if done:
         by_dir = {f['dir']: f for f in facts}
-        missing = [rel for rel in done if cos.size_of(session_key(rel)) is None]
+        missing = [rel for rel in done if not record_present(cos, archived[rel])]
         if missing:
             log(f'⚠️ 账本记录已归档，但 COS 上找不到对象 → 本轮重传 '
                 f'{missing[:5]}' + (f' 等 {len(missing)} 场' if len(missing) > 5 else ''))
@@ -795,20 +990,15 @@ def _cycle(args):
             digest = sha256_file(tar_path)
             log(f'↑ {rel}（{size / 1e6:.1f} MB，{lm["count"]} 文件）')
 
-            code, hdrs, body = cos.put_file(key, tar_path, meta={
+            parts = cos.put_sharded(key, tar_path, meta={
                 'sha256': digest, 'files': lm['count'], 'bytes': lm['total'],
                 'dir': rel, 'manifest-digest': lm['digest'],
             })
-            if code != 200:
-                log(f'  ❌ 上传失败 HTTP {code}：{body[:200]}')
-                failed.append(rel)
-                continue
-
-            good, why = verify_upload(cos, key, size, cos.size_of(key))
-            if not good:
-                log(f'  ❌ 核验不过：{why}')
-                failed.append(rel)
-                continue
+            if len(parts) > 1:
+                log(f'  · 已拆成 {len(parts)} 个对象（每片 ≤ '
+                    f'{SHARD_SIZE / 2 ** 30:.0f} GiB）：'
+                    + '、'.join(os.path.basename(p['key']) for p in parts[:3])
+                    + (' …' if len(parts) > 3 else ''))
 
             if args.keep_manifest:
                 mkey = manifest_key(rel)
@@ -825,12 +1015,18 @@ def _cycle(args):
                     failed.append(rel)
                     continue
 
-            append_record({'ts': datetime.now().isoformat(timespec='seconds'), 'dir': rel,
-                           'key': key, 'tar_bytes': size, 'tar_sha256': digest,
-                           'bytes': lm['total'], 'files': lm['count'],
-                           'digest': lm['digest'], 'etag': hdrs.get('ETag', '').strip('"'),
-                           'verify': 'ok'})
-            log(f'  ✅ 已归档 cos://{cfg["COS_BUCKET"]}/{key}（{size / 1e6:.1f} MB）')
+            rec = {'ts': datetime.now().isoformat(timespec='seconds'), 'dir': rel,
+                   'key': key, 'tar_bytes': size, 'tar_sha256': digest,
+                   'bytes': lm['total'], 'files': lm['count'],
+                   'digest': lm['digest'],
+                   'etag': parts[0].get('etag', '') if len(parts) == 1 else '',
+                   'verify': 'ok'}
+            if len(parts) > 1:
+                rec['parts'] = parts
+                rec['sharded'] = True
+            append_record(rec)
+            log(f'  ✅ 已归档 cos://{cfg["COS_BUCKET"]}/{key}（{size / 1e6:.1f} MB'
+                + (f'，{len(parts)} 个分片对象' if len(parts) > 1 else '') + '）')
             uploaded.append(rel)
         except Exception as e:
             log(f'  ❌ {rel} 出错：{type(e).__name__}: {e}')

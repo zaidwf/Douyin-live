@@ -621,7 +621,9 @@ class AnchorDaemon(threading.Thread):
                 if media['ok']:
                     print(f"[{self.anchor_name}] 音视频：{len(media['frames'])} 帧 / "
                           f"{len(media['audio'])} 段音频"
-                          + (f"，续采 {media['restarts']} 次" if media['restarts'] else ""))
+                          + (f"，续采 {media['restarts']} 次" if media['restarts'] else "")
+                          + (f"（其中停滞强杀 {media['stalls']} 次）"
+                             if media.get('stalls') else ""))
                 else:
                     # 起了 ffmpeg 却一段有效产物都没有：**不要把这种情况报成一次空采集**，
                     # 它和「本场没轮到名额」是两回事，混在一起会把真正的故障淹掉。
@@ -671,6 +673,11 @@ class AnchorDaemon(threading.Thread):
                 'frames': len(media['frames']) if media else 0,
                 'audio': len(media['audio']) if media else 0,
                 'restarts': media['restarts'] if media else 0,
+                # 「进程还活着、但产物计数 N 秒没涨」→ 强杀重拉的次数（见
+                # `liveMan.MEDIA_STALL_SECONDS`）。与 restarts 分开记：`restarts` 里
+                # 混着「进程正常早退」，而停滞是**另一种故障**（2026-10-17 实测的
+                # 8 小时 CDN 停推），混着看会把真故障淹在噪声里。
+                'stalls': media.get('stalls', 0) if media else 0,
                 # None = 本场确实起了音视频且在产出；否则是**没产出的原因**
                 'skip_reason': media_skip_reason,
                 'gate_wait_s': round(gate_wait_s, 1),

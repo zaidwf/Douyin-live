@@ -1,6 +1,6 @@
 #!/usr/bin/python
 # coding:utf-8
-"""把服务器上采完的场次自动拉回笔记本 `D:\\shock\\Documents\\data`（结构与服务器 `data/` 一致）。
+"""把服务器上采完的场次自动拉回笔记本 `D:\\CodeFile\\GithubProjects\\Tiktok-live\\data`（结构与服务器 `data/` 一致）。
 
 ## 它解决什么
 
@@ -16,7 +16,7 @@
 | 谁发起 | **笔记本定时拉取**（服务器在公网、笔记本在 NAT 后，只能笔记本主动连）|
 | 传完服务器那份 | **自动删**（`--keep-remote` 是退路）|
 | 传哪些 | **完整的传进 `data/`，不完整的也传但放 `_incomplete/`** |
-| 多久一次 | 每 10 分钟（Windows 计划任务，见文件末尾）|
+| 多久一次 | 每 30 分钟（Windows 计划任务，见文件末尾）|
 
 ## ★ 安全模型（照这个顺序读）
 
@@ -108,7 +108,7 @@ LOG = os.path.join(DIST, 'pull_sessions.log')
 
 DEFAULT_HOST = '42.192.51.77'
 REMOTE_ROOT = '/opt/douyin-live'
-DEFAULT_DEST = 'D:/shock/Documents/data'
+DEFAULT_DEST = 'D:/CodeFile/GithubProjects/Tiktok-live/data'
 
 # MSYS2 自洽前缀 —— 见模块顶部「必须来自同一个 MSYS2 前缀」
 MSYS_PREFIX = r'D:\code\msys2-rsync'
@@ -169,6 +169,12 @@ DEFAULT_MIN_FREE_GB = 10.0
 # 否则计划任务会一直挂到锁超时，看起来像死锁。
 SSH_OPTS = ('ssh -o BatchMode=yes -o ConnectTimeout=15 '
             '-o ServerAliveInterval=30 -o ServerAliveCountMax=4')
+
+# ★ 静默执行的两个前提之一（另一半是把计划任务改成 `pythonw.exe`，见文件末尾）。
+# 计划任务用 `pythonw.exe` 跑时本进程**没有控制台**，而 ssh.exe / rsync.exe 都是
+# 控制台程序 —— 不传这个标志，Windows 会给**每一个**子进程新开一个黑窗，于是
+# 「静默」变成每轮弹好几个窗、而且一闪即过（更难查）。非 Windows 上没有这个常量。
+CREATE_NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 
 # rsync 退出码 → 我们怎么处理。**只有 0 可接受。**
 RSYNC_RC = {
@@ -365,7 +371,7 @@ def marker_payload(rec):
     **不含任何凭据**（账本里本来也没有）：它只说明去哪取那场 tar；取的时候用的是
     服务器上的 `config/cos.env`。
     """
-    return {
+    out = {
         'key': rec.get('key', ''),
         'tar_bytes': rec.get('tar_bytes'),
         'tar_sha256': rec.get('tar_sha256'),
@@ -375,6 +381,12 @@ def marker_payload(rec):
         'digest': rec.get('digest'),
         'archived_ts': rec.get('ts'),
     }
+    # >4 GiB 的场次在 COS 上是**多个独立对象**（不是 multipart）：`key` 只是逻辑键，
+    # 真正的对象在 `parts` 里。不写进去的话，以后按指针取媒体会去找一个不存在的 tar。
+    if rec.get('parts'):
+        out['sharded'] = True
+        out['parts'] = rec['parts']
+    return out
 
 
 def write_marker(dir_abs, rec):
@@ -384,10 +396,18 @@ def write_marker(dir_abs, rec):
     从出现的第一刻起就是终态，永远不会存在「已经能看见、但还没有指针」的中间状态。
     """
     payload = marker_payload(rec or {})
-    payload['note'] = (
-        '本目录只有顶层文本；媒体（frames/ + audio/）在 COS 上的这个对象里。'
-        '取回：下载该 tar 后 `tar -xf` 与本地目录合并。' if rec else
-        '⚠️ 本轮 COS 账本里没有这一场 —— 媒体可能还没归档，**先别删服务器那份**')
+    if rec and rec.get('parts'):
+        payload['note'] = (
+            '本目录只有顶层文本；媒体（frames/ + audio/）在 COS 上的**多个分片对象**里'
+            '（见 parts，按顺序拼接）。取回：依次下载 parts 后用 '
+            '`cat part000 part001 … > live_x.tar` 合并，再 `tar -xf` 与本地目录合并。')
+    elif rec:
+        payload['note'] = (
+            '本目录只有顶层文本；媒体（frames/ + audio/）在 COS 上的这个对象里。'
+            '取回：下载该 tar 后 `tar -xf` 与本地目录合并。')
+    else:
+        payload['note'] = (
+            '⚠️ 本轮 COS 账本里没有这一场 —— 媒体可能还没归档，**先别删服务器那份**')
     try:
         with open(os.path.join(dir_abs, LOCAL_MARKER), 'w', encoding='utf-8') as fh:
             json.dump(payload, fh, ensure_ascii=False, indent=2)
@@ -532,7 +552,7 @@ def run(argv, timeout=1800, stdin_text=None):
     """跑一个子进程 → `(rc, stdout文本, stderr文本)`。**argv 列表、绝不 shell=True**"""
     try:
         p = subprocess.run(argv, capture_output=True, timeout=timeout,
-                           env=child_env(),
+                           env=child_env(), creationflags=CREATE_NO_WINDOW,
                            input=(stdin_text.encode('utf-8') if stdin_text is not None else None))
     except subprocess.TimeoutExpired:
         return 124, '', f'超时（{timeout}s）'
@@ -742,7 +762,8 @@ _LOG_QUIET = False
 
 def log(msg):
     line = f'[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}'
-    if not _LOG_QUIET:
+    # ★ `pythonw.exe` 下 `sys.stdout is None`（CPython 的 print 会静默返回，但别依赖它）
+    if not _LOG_QUIET and sys.stdout is not None:
         print(line)
     try:
         os.makedirs(DIST, exist_ok=True)
@@ -1191,6 +1212,13 @@ def _cycle(args):
 
 if __name__ == '__main__':
     # Windows 计划任务入口（见 service/README.md）：
-    #   schtasks /Create /TN "DouyinPull" /SC MINUTE /MO 10 /F ^
-    #     /TR "\"<python.exe 绝对路径>\" \"<repo>\service\pull_sessions.py\" --quiet"
+    #   schtasks /Create /TN "DouyinPull" /SC MINUTE /MO 30 /F ^
+    #     /TR "\"<pythonw.exe 绝对路径>\" \"<repo>\service\pull_sessions.py\" --no-cos --quiet"
+    #   ★ 用 `pythonw.exe` 而不是 `python.exe` —— 前者不带控制台，计划任务跑起来**不弹黑窗**。
+    #     配套：本模块的子进程都带 `CREATE_NO_WINDOW`（见文件顶部常量），否则 ssh/rsync
+    #     会各弹一个窗。日志照写 `service/dist/pull_sessions.log`，`--quiet` 只关 stdout。
+    #   ⚠️ `--no-cos` 不能省：服务器已挂 douyin-archive.timer，两边同跑会抢
+    #      cos_archive 的锁、每轮 EXIT_LOCKED(3) 空转。
+    #   ⚠️ 装完要关电池限制（默认「用电池时不启动」），见 service/README.md 那节。
+    #   ⚠️ `pythonw` 下看不到任何 stdout —— **排查/自检请改用 `python.exe` 手工跑**。
     sys.exit(main())

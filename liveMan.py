@@ -426,6 +426,31 @@ def extract_stream_urls_from_enter(data):
 MEDIA_WATCHDOG_INTERVAL = 30
 MEDIA_MAX_RESTARTS = 20
 
+# **停滞判据**（2026-10-17 实测）：长会话在**整 8 小时**处 CDN 停推 —— 三场长直播的
+# 帧数都恰好 **5760**（= 480 分钟 × 12 帧/分）、音频段 960（= 480 × 2），最后一帧都在
+# 开场后 **8h00m05s / 06s / 07s**；而 ffmpeg 进程**仍存活**（CPU 仍占 1.4–1.7%），
+# 只是再也不写文件。原判据只看 `poll() is not None`（进程退出），这种「活着但不出数」
+# **永远发现不了** —— 既不会续采，也没有任何日志。
+#
+# 阈值取 300s：健康会话的帧每 5s 一个、音频段每 30s 一段，300s 是**两个数量级**的余量
+# （与 WS 僵死的 300s 同一口径）；而 8 小时处断流每多等一分钟就永久缺一分钟媒体。
+MEDIA_STALL_SECONDS = 300
+
+
+def media_output_progress(count, prev_count, prev_ts, now, threshold):
+    """某一模态本轮的产物计数 → `(是否停滞, 新的基线时间戳)`
+
+    `count != prev_count` 说明有新产物，基线时间戳前移到 `now`；否则距上次变化
+    ≥ `threshold` 秒判停滞（时间戳**保持不动**，于是日志里的停摆时长会持续增长）。
+
+    计数用**非空文件个数**而不是 mtime：`frame_*.jpg` 每 5 秒一个新文件、
+    `segment_*.wav` 每 30 秒一段，个数只会单调增加；mtime 会被正在写的那个文件的
+    系统缓冲影响。抽成模块级纯函数是为了**可单测**（同 `next_reconnect_state`）。
+    """
+    if count != prev_count:
+        return False, now
+    return (now - prev_ts) >= threshold, prev_ts
+
 
 # ── WS 断线自动重连（2026-10-16，用在 `DouyinLiveWebFetcher.start`）──────────
 #
@@ -515,7 +540,8 @@ class MediaCapture:
 
     def __init__(self, live_id, out_dir, *, fetcher=None, url_index=0, want_audio=True,
                  want_frames=True, audio_segment=30, frame_interval=5, merged=True,
-                 max_seconds=None, stream_proxy=None, log=print):
+                 max_seconds=None, media_stall=MEDIA_STALL_SECONDS, stream_proxy=None,
+                 log=print):
         """
         :param fetcher: `DouyinLiveWebFetcher` 实例，用于复用其 ttwid/cookie 与页面请求
         :param out_dir: 落盘目录（传 `DataRecorder.path`），内部再建 `audio/` `frames/`
@@ -528,7 +554,11 @@ class MediaCapture:
         :param merged: 音视频是否合并到**一个** ffmpeg（默认 True）。合并省一半带宽
             （一条流只读一遍）、一半 RSS、一半进程数，代价是两模态故障域耦合。
             仅在同时要音频与抽帧时生效；只要一路时自动退化。要 A/B 对比时传 False。
-        :param max_seconds: **防僵尸安全上限**（`-t`），不是主停止手段；None 表示不加
+        :param max_seconds: **防僵尸安全上限**（`-t`），不是主停止手段，也**不是本场
+            时长**：到点 ffmpeg 正常退出后由 `_watchdog` 自动续采；None 表示不加
+        :param media_stall: **停滞判据**的阈值（秒）：进程还活着、但该模态的产物计数
+            这么久一次没涨 → 强杀并重解析流地址续采。`0` = 关闭（回到只看进程退出的
+            旧行为）。默认 300（见 `MEDIA_STALL_SECONDS` 的实测依据）。
         :param stream_proxy: ffmpeg 拉流用的代理 URL。**默认 None = 跟随环境变量**
             `DOUYIN_STREAM_PROXY`（不设就是直连 = 生产口径，与改动前逐字节等价）；
             传空串 `''` 可强制直连。与控制面的 `DOUYIN_PROXY` **刻意分开**——
@@ -546,6 +576,11 @@ class MediaCapture:
         # 只有两个模态都要时才谈得上合并（任一为 False 就没有第二个输出可合）
         self.merged = bool(merged) and want_audio and want_frames
         self.max_seconds = max_seconds
+        self.media_stall = media_stall
+        self.stalls = 0             # 「活着但不出数」→ 强杀续采的次数（与 restarts 分开记）
+        # 模态 → (上次产物计数, 该计数最后一次变化的时间)。起/续起进程时由 `_spawn` 建基线
+        self._progress = {}
+        self._resolve_fails = 0     # 续采时连续解析不到流地址的次数（日志限流用）
         # None 表示「跟随 DOUYIN_STREAM_PROXY」，空串表示「强制直连」——用 is None 区分
         self.stream_proxy = stream_proxy_url() if stream_proxy is None else (stream_proxy or None)
         self.log = log
@@ -599,6 +634,10 @@ class MediaCapture:
 
     def _time_cap(self):
         """`-t` 参数（防僵尸上限）。注意**不是**主停止手段，主停止是 stop_media()
+
+        ⚠️ 到点 ffmpeg 会**正常退出**，但**这也不是本场结束**：`_watchdog` 会重解析
+        地址、带 `-start_number` 续采（2026-10-18 起；此前 watchdog 自己也到点 `return`，
+        于是健康流的媒体就静默断在 8 小时处 —— 见 `_watchdog` 的说明）。
 
         ⚠️ 调用方必须把它放在 `-i` **之前**。放在 `-i` 之后它是**输出选项**，只作用于
         紧接着的那个输出 —— 合并模式（一条命令两个输出）下第二个输出就完全没有上限了
@@ -701,6 +740,11 @@ class MediaCapture:
                     stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                     stderr=open(self.merged_log, 'ab'))
                 self.audio_proc = self.frame_proc = p
+                # 停滞判据的基线：**从进程起来这一刻算起**。不建基线的话 watchdog 会拿
+                # 上一轮（已强杀的那个进程）的旧时间戳去比，刚续采就判停滞、无限重启。
+                now = time.time()
+                self._progress['audio'] = (an, now)
+                self._progress['frames'] = (fn, now)
             return
         if self.want_audio and self.audio_proc is None:
             n = self._count_files(os.path.join(self.audio_dir, "segment_*.wav"))
@@ -708,15 +752,20 @@ class MediaCapture:
                 self._audio_cmd(self.stream_url, n),
                 stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                 stderr=open(self.audio_log, 'ab'))
+            self._progress['audio'] = (n, time.time())
         if self.want_frames and self.frame_proc is None:
             n = self._count_files(os.path.join(self.frames_dir, "frame_*.jpg"))
             self.frame_proc = subprocess.Popen(
                 self._frame_cmd(self.stream_url, n),
                 stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                 stderr=open(self.frame_log, 'ab'))
+            self._progress['frames'] = (n, time.time())
 
     def start_media(self):
         """解析流地址并起 ffmpeg 进程。返回是否**至少起了一个**进程（失败不抛异常）"""
+        self.stalls = 0
+        self._progress.clear()
+        self._resolve_fails = 0
         url = self._resolve_stream_url()
         if not url:
             self.log('[media] 未解析到流地址（未开播 / 页面无 flv_pull_url），本场音视频缺失')
@@ -830,7 +879,7 @@ class MediaCapture:
         audio = self._prune_empty(os.path.join(self.audio_dir, "segment_*.wav"))
         frames = self._prune_empty(os.path.join(self.frames_dir, "frame_*.jpg"))
         return {'audio': audio, 'frames': frames, 'restarts': self.restarts,
-                'ok': bool(audio or frames)}
+                'stalls': self.stalls, 'ok': bool(audio or frames)}
 
     def stop(self):
         """`stop_media` 的别名（便于挂成 on_offline 之类的回调）"""
@@ -838,37 +887,105 @@ class MediaCapture:
 
     # ---------------- 长会话看护 ----------------
 
-    def _watchdog(self):
-        """流地址会过期 → ffmpeg 可能中途早退。早退则重解析地址并**续号**续采。
+    def _stalled_modalities(self, now):
+        """还活着、但产物计数超过阈值没涨的模态 → `{模态: 已停摆秒数}`
 
-        ⚠️ 本机制**尚未经长会话实测**（需一场 ≥1 小时的真实直播验证：确认过期后能续上、
-        且 `segment_*.wav` 时间连续无缺口）。若实测发现问题，可先靠 `max_seconds` 兜底。
+        只看**进程还活着**的那些：进程退出由原来的 `poll()` 判据负责，两条判据不重叠。
+
+        ⚠️ 阈值按模态放宽：音频的计数每 `audio_segment` 秒才涨一次、帧每
+        `frame_interval` 秒一个，所以实际阈值取 `max(media_stall, 2 × 该模态间隔)` ——
+        否则有人把段长调到 600s 时，正常会话也会被判成停滞。
+        """
+        if self.media_stall <= 0:
+            return {}
+        pairs = []
+        if self.want_audio:
+            pairs.append(('audio', self.audio_proc,
+                          os.path.join(self.audio_dir, 'segment_*.wav'),
+                          max(self.media_stall, 2 * self.audio_segment)))
+        if self.want_frames:
+            pairs.append(('frames', self.frame_proc,
+                          os.path.join(self.frames_dir, 'frame_*.jpg'),
+                          max(self.media_stall, 2 * self.frame_interval)))
+        stalled = {}
+        for kind, proc, pattern, threshold in pairs:
+            if proc is None or proc.poll() is not None:
+                continue                     # 已退出的交给 poll() 判据
+            count = self._count_files(pattern)
+            prev = self._progress.get(kind)
+            if prev is None:
+                self._progress[kind] = (count, now)   # 首次观测只建基线
+                continue
+            stopped, ts = media_output_progress(count, prev[0], prev[1], now, threshold)
+            self._progress[kind] = (count, ts)
+            if stopped:
+                stalled[kind] = int(now - ts)
+        return stalled
+
+    def _watchdog(self):
+        """两条判据，处置相同（重解析地址 + **续号**续采）：
+
+        1. **进程退出**：流地址过期 / `-t` 到点 → ffmpeg 中途退出。
+        2. **停滞**：进程**还活着**，但该模态的产物计数 `media_stall` 秒内一次没涨
+           —— 2026-10-17 实测：长会话在**整 8 小时**处停推（ffmpeg 仍存活、CPU 仍占
+           1.4–1.7%），但再也不写文件。只看进程退出的话这种静默停摆**永远发现不了**。
+
+        ⚠️ **不能因为 `-t` 到点就退出本循环**（2026-10-18 实测的第二次静默断流）：
+        `auto_crawl` 传 `max_seconds=8h`，ffmpeg 命令行带 `-t 28800`，**健康流**也会在
+        整 8 小时处**正常退出**。原实现里有一句「`-t` 到点属于正常结束，直接 return」，
+        于是 8 小时后的这次退出**没人续采**，媒体静默停在 **5760 帧 / 960 段**
+        （= 480 分钟 × 12 帧/分、× 2 段/分），文本照常、所有指标看着都正常。
+        当晚 3 场长直播里 2 场就这么断了；第 3 场只是**恰好**赶在守卫 return 之前的一轮
+        被续采到（帧数从 5760 继续涨到 5856，ffmpeg 带 `-start_number 5760` 重拉）——
+        证明**流本身没停**，是我们自己按了停止键。
+        `-t` 只是**单进程防僵尸上限**，不是「本场结束」；本场结束的唯一信号是
+        `_stop_event`（`stop_media()` 置位）。
+
+        ⚠️ 停滞路径必须**先杀进程再 spawn**：`_spawn()` 见到引用非 None 会直接返回，
+        不杀的话新进程根本起不来，旧进程继续占着一条流的带宽不出数。
         """
         while not self._stop_event.wait(MEDIA_WATCHDOG_INTERVAL):
-            # `-t` 到点属于**正常结束**，不能当早退去续采
-            if self.max_seconds and (time.time() - self._t0) >= self.max_seconds:
-                return
+            now = time.time()
             dead_audio = (self.want_audio and self.audio_proc is not None
                           and self.audio_proc.poll() is not None)
             dead_frame = (self.want_frames and self.frame_proc is not None
                           and self.frame_proc.poll() is not None)
-            if not (dead_audio or dead_frame):
+            stalled = self._stalled_modalities(now)
+            if not (dead_audio or dead_frame or stalled):
                 continue
             if self.restarts >= MEDIA_MAX_RESTARTS:
                 self.log(f'[media] 续采已达上限 {MEDIA_MAX_RESTARTS} 次，放弃')
                 return
             url = self._resolve_stream_url()
             if not url:
+                # ⚠️ 这条路径原来是**完全静默**的（只等下一轮）—— 媒体确实停了，却不留
+                # 任何线索。限流打印：第 1 次 + 其后每 10 次（按 30s 间隔 ≈ 5 分钟一条）。
+                self._resolve_fails += 1
+                if self._resolve_fails == 1 or self._resolve_fails % 10 == 0:
+                    self.log(f'[media] 续采失败：解析不到流地址'
+                             f'（连续第 {self._resolve_fails} 次），稍后再试')
                 continue
+            self._resolve_fails = 0
             self.stream_url = url
             self.restarts += 1
-            what = '合并进程' if self.merged else f'音频={dead_audio} 抽帧={dead_frame}'
-            self.log(f'[media] ffmpeg 提前退出（{what}），'
-                     f'用新流地址续采（第 {self.restarts} 次）')
-            if dead_audio:
-                self.audio_proc = None
-            if dead_frame:
-                self.frame_proc = None
+            if stalled:
+                # 停滞路径：进程还活着 → 必须先收掉（`_kill_procs` 按对象去重，
+                # 合并模式下两个字段指向同一进程，只停一次）。
+                # 拆进程模式下若只有一路停滞，另一路健康也会被一起重启 —— 代价是
+                # 最多一个音频段（30s）的缺口，换来「不会漏掉任何一路停摆」。
+                self.stalls += 1
+                who = '、'.join(f'{k}={v}s' for k, v in stalled.items())
+                self.log(f'[media] ffmpeg 活着但不出数（{who} 没有任何新产物），'
+                         f'强杀后用新流地址续采（第 {self.restarts} 次）')
+                self._kill_procs()
+            else:
+                what = '合并进程' if self.merged else f'音频={dead_audio} 抽帧={dead_frame}'
+                self.log(f'[media] ffmpeg 提前退出（{what}），'
+                         f'用新流地址续采（第 {self.restarts} 次）')
+                if dead_audio:
+                    self.audio_proc = None
+                if dead_frame:
+                    self.frame_proc = None
             self._spawn()
             # 收尾竞态：停止信号可能在 `_spawn()` **之后**才置位（上面的守卫是在
             # `_resolve_stream_url()` 之后判的，而停止也可能恰好挤在这中间）。此时

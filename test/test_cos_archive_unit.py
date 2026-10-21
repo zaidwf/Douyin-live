@@ -142,6 +142,20 @@ def t_signature():
           ca.cos_authorization('put', 'data/20261016/live_x.tar', hdrs, 'AKIDEXAMPLE',
                                'SECRET', start=1700000000, expire=60) != a1)
 
+    # 分片上传的查询参数必须进签名（否则 COS 会 403）
+    a3 = ca.cos_authorization('put', 'data/20261016/live_x.tar', hdrs,
+                              'AKIDEXAMPLE', 'SECRET', start=1700000000,
+                              params={'partNumber': '2', 'uploadId': 'abc+/='})
+    check('★ 分片参数进入 q-url-param-list（小写、排序、; 连接）',
+          '&q-url-param-list=partnumber;uploadid&' in a3, a3[:180])
+    check('分片参数不同 → 签名不同', a3 != a1)
+    check('参数值为空也参与签名（?uploads）',
+          '&q-url-param-list=uploads&' in
+          ca.cos_authorization('post', 'data/20261016/live_x.tar',
+                               {'Host': host, 'Content-Length': '0'},
+                               'AKIDEXAMPLE', 'SECRET', start=1700000000,
+                               params={'uploads': ''}))
+
 
 # ================================================================ [2] 凭据
 def t_credentials(tmp):
@@ -505,6 +519,59 @@ def t_dump_ledger(tmp):
          ca.load_cos_env, ca._LOG_QUIET) = old
 
 
+# ================================================================ [9] 分片对象计划
+def t_shard():
+    print('[9] 分片对象计划（纯函数；不是 multipart）')
+    check('10 字节 / 5 → 两片（0 基）',
+          ca.shard_plan(10, 5) == [(0, 0, 5), (1, 5, 5)])
+    check('11 字节 / 5 → 最后一片是余数',
+          ca.shard_plan(11, 5) == [(0, 0, 5), (1, 5, 5), (2, 10, 1)])
+    check('0 字节 → 0 片', ca.shard_plan(0, 5) == [])
+    check('对象键 → .partNNN',
+          ca.shard_key('data/20261019/live_x.tar', 7)
+          == 'data/20261019/live_x.tar.part007')
+    size = 5399797760
+    parts = ca.shard_plan(size, ca.SHARD_SIZE)
+    check('★ 5.03 GiB / 4 GiB → 2 片且总长不变',
+          len(parts) == 2 and sum(p[2] for p in parts) == size,
+          f'parts={len(parts)} total={sum(p[2] for p in parts)}')
+    check('片号从 0 连续、偏移连续',
+          [p[0] for p in parts] == list(range(len(parts)))
+          and all(parts[i][1] + parts[i][2] == parts[i + 1][1]
+                  for i in range(len(parts) - 1)))
+    check('★ 阈值为 4 GiB，低于 COS 单 PUT 上限 5 GiB',
+          ca.SHARD_THRESHOLD == 4 * 1024 ** 3
+          and ca.SHARD_THRESHOLD < 5 * 1024 ** 3)
+
+    d = 'data/20261019/live_x'
+    k = ca.session_key(d)
+    check('老记录（没有 parts）→ 唯一对象就是规范 tar 键',
+          ca.record_parts({'dir': d, 'key': k, 'tar_bytes': 9})
+          == [{'key': k, 'bytes': 9}])
+    rec = {'dir': d, 'key': k, 'tar_bytes': size,
+           'parts': [{'key': k + '.part000', 'bytes': 4 * 1024 ** 3},
+                     {'key': k + '.part001', 'bytes': size - 4 * 1024 ** 3}]}
+    check('新记录 → parts 原样返回', ca.record_parts(rec) is rec['parts'])
+
+    class FakeCos:
+        def __init__(self, objs):
+            self.objs = objs
+
+        def size_of(self, key):
+            return self.objs.get(key)
+
+    full = {p['key']: p['bytes'] for p in rec['parts']}
+    check('★ 全部分片都在且字节对 → True',
+          ca.record_present(FakeCos(full), rec))
+    one_missing = dict(full)
+    one_missing.pop(rec['parts'][1]['key'])
+    check('★ 缺第二片 → False（不会只看第一片）',
+          not ca.record_present(FakeCos(one_missing), rec))
+    wrong = dict(full)
+    wrong[rec['parts'][0]['key']] -= 1
+    check('★ 字节数不符 → False', not ca.record_present(FakeCos(wrong), rec))
+
+
 # ================================================================ [8] 契约
 def t_contract():
     print('[8] 契约（跨文件 grep）')
@@ -547,8 +614,11 @@ def t_contract():
     check('★ `--dump-ledger` 在**抢锁之前**短路（纯读，不该跟正在跑的那一轮抢锁）',
           'if args.dump_ledger:' in src
           and src.index('if args.dump_ledger:') < src.index('if not acquire_lock(args.lock_min)'))
-    check('★ 活证据用既有的 `Cos.size_of`（与 1b 步「对象还在不在」同一判据，不另造一个）',
-          'cos.size_of(session_key(' in dl)
+    rp = src[src.index('def record_present'):src.index('class _SliceReader')]
+    check('★ 活证据走 `record_present`（内部用既有的 `Cos.size_of`，单/多片同一判据）',
+          'record_present(cos, ledger[d])' in dl
+          and 'cos.size_of(key)' in rp
+          and 'cos.head(' not in rp)
     check('★ dump-ledger 模式强制 quiet（否则 `log()` 会 print 到 stdout 把 JSON 冲掉）',
           '_LOG_QUIET = True' in dl)
     check('★ 诊断一律走 stderr（stdout 只留 JSON 给调用方解析）',
@@ -564,6 +634,7 @@ def main():
         t_verify_upload()
         t_tar(tmp)
         t_ledger_lock(tmp)
+        t_shard()
         t_contract()
         t_dump_ledger(tmp)
     finally:

@@ -244,7 +244,7 @@ ls -l /opt/douyin-live/service/dist/live_ledger.xlsx   # 下载到本地用 Exce
 
 | 数据 | 去哪 | 通路 |
 |---|---|---|
-| 顶层文本/数值（8 种文件，约 1 MB/场） | 笔记本 `D:\shock\Documents\data` | 公网 ssh+rsync |
+| 顶层文本/数值（8 种文件，约 1 MB/场） | 笔记本 `D:\CodeFile\GithubProjects\Tiktok-live\data` | 公网 ssh+rsync |
 | **整场**（含音视频，每场一个 tar） | COS（见四之五） | 内网 59 MB/s、**免费** |
 
 方向是**笔记本主动拉**，所以工具 `service/pull_sessions.py` **不在服务器的部署包里**
@@ -293,6 +293,10 @@ python service/pull_sessions.py --limit 0                 # 拉完积压 + 真�
 | 服务器 | `douyin-archive.timer`（**在部署包里**） | 1 小时 | ① 归档到 COS（**不删**） |
 | 笔记本 | Windows 计划任务 `DouyinPull` | 30 分钟 | ② 拉顶层文本 + ③ 门禁通过后删 |
 
+> 笔记本那一半（`schtasks` 安装、`--no-cos`、电池限制、静默执行的 `pythonw`、本地
+> `rsync`/`ssh` 必须同源）**不在本文档**，见 `service/README.md` 的「自动触发（两台机器）」
+> 一节。本文档只管服务器侧。
+
 ```bash
 # 服务器侧：pack.sh 后解压即得
 sudo cp /opt/douyin-live/service/douyin-archive.{service,timer} /etc/systemd/system/
@@ -311,42 +315,19 @@ sudo systemctl start douyin-reclaimcheck.service     # 立刻体检一次
 体检本身是**只读**的（不抢锁、不写账本、不删东西），三条判据（磁盘水位 / 归档心跳 /
 账本对象活 HEAD）、阈值与边界见 `service/README.md` 第四节末。
 
-```cmd
-:: 笔记本侧：/tr 直接起 python.exe，不经 bash —— Python 自己会设 MSYS2 的 PATH
-schtasks /Create /TN "DouyinPull" /SC MINUTE /MO 30 /F ^
-  /TR "\"D:\code\anaconda3\python.exe\" \"D:\CodeFile\GithubProjects\Tiktok-live\service\pull_sessions.py\" --no-cos --quiet"
-
-:: ★ 装完必须关掉电池限制 —— 默认「用电池时不启动」，笔记本一拔电源链路就断
-powershell -NoProfile -Command "$s=(Get-ScheduledTask -TaskName 'DouyinPull').Settings; $s.DisallowStartIfOnBatteries=$false; $s.StopIfGoingOnBatteries=$false; Set-ScheduledTask -TaskName 'DouyinPull' -Settings $s"
-```
-
-⚠️ 笔记本这条**必须带 `--no-cos`**：服务器已经自己挂了归档 timer，再让笔记本每 30 分钟
-去触发一次，两边会抢同一个 `cos_archive` 锁（撞锁返回 `EXIT_LOCKED(3)`，那一轮白白空转）。
-`--no-cos` 只关掉「写」（归档），**COS 账本照读**，删除门禁不受影响。
-
-⚠️ 三个已知边界：
-1. **笔记本侧是 `Interactive only`**（`schtasks` 默认），所以**机器重启后要有人登录**任务
-   才会跑。改成「不管是否登录都跑」得存密码（`/RU ... /RP ...`）或 S4U —— 但 S4U 读不到
-   用户目录下的 SSH 密钥，反而更糟。**保持登录会话是前提**。
-2. **笔记本关机期间服务器磁盘照涨**：归档那条腿照跑（数据进 COS，不会丢），但删除那条腿
+⚠️ 两个已知边界：
+1. **笔记本关机期间服务器磁盘照涨**：归档那条腿照跑（数据进 COS，不会丢），但删除那条腿
    停在笔记本上，`data/` 会堆。长假期回来要手动补一次 `pull_sessions.py --limit 0`。
-3. **不要拿 `cos_archive` / `pull_sessions` 的退出码当「数据在 COS」的证据**：
+2. **不要拿 `cos_archive` / `pull_sessions` 的退出码当「数据在 COS」的证据**：
    `cos_archive` 的 `0` 只说明「我跑完了」（`--dump-ledger -` 的活 HEAD 才是证据），
    `pull_sessions` 的 `3`（撞锁）与 `1`（有场次失败）在正常轮次里也会出现。
    **链路的告警面是 `douyin-reclaimcheck.timer`**（`systemctl --failed` 里的一项），
-   它专测这件事：磁盘水位 / 归档心跳 / 账本对象此刻还在不在。人话分别在
-   `service/dist/pull_sessions.log`（笔记本）、`journalctl -u douyin-archive`
-   与 `journalctl -u douyin-reclaimcheck`（服务器）。
+   它专测这件事：磁盘水位 / 归档心跳 / 账本对象此刻还在不在。人话在
+   `journalctl -u douyin-archive` 与 `journalctl -u douyin-reclaimcheck`（服务器）。
 
-⏪ 回退：`schtasks /Delete /TN "DouyinPull" /F`；
-`sudo systemctl disable --now douyin-archive.timer`；
-`sudo systemctl disable --now douyin-reclaimcheck.timer`。三条互不影响，可以只停一条
+⏪ 回退：`sudo systemctl disable --now douyin-archive.timer`；
+`sudo systemctl disable --now douyin-reclaimcheck.timer`。两条互不影响，可以只停一条
 （把体检停掉只是不再出声，「盘在涨 / timer 没跑 / 对象丢了」这三件事本身不会因此变好）。
-
-> ⚠️ 本地 `rsync`/`ssh` **必须同源**：都取 `D:\code\msys2-rsync\usr\bin` 下那一对
-> （调 Git 或 Windows 自带的 ssh 都有确定报错），且本地路径要写 MSYS2 的 `/d/...` 形式。
-> 工具内部把这条关系钉死了（私有 helper + 绝对路径），**不要**把那个 `usr\bin` 加进系统
-> PATH —— 会顶掉 Git 的 ssh，`git push` 会坏。详见 `D:\code\msys2-rsync\README.md`。
 
 **⚠️ ★ 公网这条路的产能（2026-10-16 实测）**：服务器出口被腾讯云轻量带宽包硬卡在
 **≈ 0.33 MiB/s（2.76 Mbps）**，**并发不叠加**（2/4/8 路总量一样），而入口 4.2 MiB/s
